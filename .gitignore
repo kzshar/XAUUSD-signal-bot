@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.log
+bot_output.log

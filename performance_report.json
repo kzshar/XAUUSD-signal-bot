@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-04-10T08:02:15.608647+04:00",
+  "timezone": "Asia/Dubai",
+  "trade_metrics": {},
+  "bot_health": {
+    "bot_running": true,
+    "process_detail": "Running (PID 3530)",
+    "log_analysis": {
+      "log_exists": true,
+      "total_lines": 3742,
+      "recent_lines_checked": 3742,
+      "error_count": 45,
+      "error_rate": 0.012,
+      "scan_count": 168,
+      "signal_count": 1,
+      "scan_signal_ratio": 0.006,
+      "cold_starts_session": 2,
+      "cold_starts_today": 2,
+      "api_failures": 0,
+      "last_log_entry": "2026-04-09 04:28:59",
+      "last_entry_age_mins": 1653.3,
+      "bot_stale": true,
+      "log_size_bytes": 626185
+    }
+  },
+  "smc_quality": {},
+  "override_state": {
+    "loss_limit_override": false
+  },
+  "suggestions": [
+    "⚠️ Bot log has not updated for 1653.3 mins during market hours — bot may be frozen or stuck.",
+    "📉 Only 0.6% of scans are generating signals — market may be ranging or checklist threshold is too strict."
+  ]
+}
