@@ -354,16 +354,28 @@ def compute_trade_metrics(trades: List[Dict], signals: List[Dict]) -> Dict:
 # ─────────────────────────────────────────────────────────────
 
 def check_bot_process() -> Tuple[bool, str]:
-    """Return (is_running, detail)."""
+    """Return (is_running, detail). Works in both systemd and container environments."""
+    # Method 1: pgrep
     try:
         result = subprocess.run(["pgrep", "-f", "bot.py"],
                                 capture_output=True, text=True)
         pids = [p for p in result.stdout.strip().split() if p]
         if pids:
             return True, f"Running (PID {', '.join(pids)})"
-        return False, "No bot.py process found"
-    except Exception as exc:
-        return False, f"Process check error: {exc}"
+    except Exception:
+        pass
+    
+    # Method 2: Check bot.log freshness (if log updated in last 5 min, bot is alive)
+    try:
+        if os.path.exists(BOT_LOG_FILE):
+            mtime = os.path.getmtime(BOT_LOG_FILE)
+            age_min = (time.time() - mtime) / 60.0
+            if age_min < 5.0:
+                return True, f"Running (log active {age_min:.1f}m ago)"
+    except Exception:
+        pass
+    
+    return False, "No bot.py process found"
 
 
 def analyze_bot_log(state: Dict) -> Dict:
