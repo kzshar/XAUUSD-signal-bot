@@ -84,11 +84,11 @@ SCAN_UPDATE_INTERVAL = 900
 # DYNAMIC KEY LEVELS - Updated for current price range
 # ============================================================
 KEY_LEVELS = {
-    "resistance": [4540, 4555, 4570, 4585, 4600, 4620],
-    "support": [4520, 4510, 4500, 4490, 4475, 4460],
-    "round_numbers": [4500, 4550, 4600],
-    "demand_zones": [(4490, 4500), (4510, 4520), (4460, 4475)],
-    "supply_zones": [(4555, 4570), (4585, 4600), (4620, 4640)]
+    "resistance": [4820, 4835, 4850, 4870, 4900, 4950],
+    "support": [4800, 4785, 4770, 4750, 4730, 4700],
+    "round_numbers": [4700, 4750, 4800, 4850, 4900, 4950, 5000],
+    "demand_zones": [(4780, 4800), (4750, 4770), (4700, 4730)],
+    "supply_zones": [(4835, 4850), (4870, 4900), (4950, 4970)]
 }
 
 # ============================================================
@@ -202,14 +202,22 @@ def detect_liquidity_sweep(prices, direction):
         # Find recent low, check if price went below it then bounced
         min_price = min(recent[:-5])
         recent_min = min(recent[-10:])
-        if recent_min < min_price and current > recent_min + 1.0:
+        if recent_min <= min_price and current > recent_min + 0.5:
             return True
+        # Also check: price dipped near a support/demand zone
+        for s in KEY_LEVELS["support"]:
+            if recent_min <= s + 2 and current > s:
+                return True
     elif direction == "SELL":
         # Find recent high, check if price went above it then dropped
         max_price = max(recent[:-5])
         recent_max = max(recent[-10:])
-        if recent_max > max_price and current < recent_max - 1.0:
+        if recent_max >= max_price and current < recent_max - 0.5:
             return True
+        # Also check: price spiked near a resistance/supply zone
+        for r in KEY_LEVELS["resistance"]:
+            if recent_max >= r - 2 and current < r:
+                return True
     
     return False
 
@@ -361,10 +369,10 @@ def run_smc_checklist(price, direction, prices_list):
     
     # 5. Displacement
     disp = detect_displacement(prices_list)
-    if disp >= 1.5:
+    if disp >= 1.2:
         checks.append(("✅", "Displacement", f"Strong ({disp:.1f}x avg)"))
         score += 1
-    elif disp >= 1.0:
+    elif disp >= 0.8:
         checks.append(("⚠️", "Displacement", f"Moderate ({disp:.1f}x avg)"))
         score += 0.5
     else:
@@ -389,16 +397,16 @@ def run_smc_checklist(price, direction, prices_list):
     
     # 8. RSI Confirmation
     rsi = calculate_rsi(14)
-    if direction == "BUY" and rsi < 40:
-        checks.append(("✅", "RSI", f"{rsi:.1f} - Oversold (BUY confirm)"))
+    if direction == "BUY" and rsi < 45:
+        checks.append(("✅", "RSI", f"{rsi:.1f} - Oversold zone (BUY confirm)"))
         score += 1
-    elif direction == "BUY" and rsi < 50:
+    elif direction == "BUY" and rsi < 55:
         checks.append(("⚠️", "RSI", f"{rsi:.1f} - Neutral-low"))
         score += 0.5
-    elif direction == "SELL" and rsi > 60:
-        checks.append(("✅", "RSI", f"{rsi:.1f} - Overbought (SELL confirm)"))
+    elif direction == "SELL" and rsi > 55:
+        checks.append(("✅", "RSI", f"{rsi:.1f} - Overbought zone (SELL confirm)"))
         score += 1
-    elif direction == "SELL" and rsi > 50:
+    elif direction == "SELL" and rsi > 45:
         checks.append(("⚠️", "RSI", f"{rsi:.1f} - Neutral-high"))
         score += 0.5
     else:
@@ -427,7 +435,7 @@ CHECKLIST_TEXT = """
 8. [ ] RSI confirmation
 9. [ ] R:R ≥ 1:2.5 with SL at structure
 ━━━━━━━━━━━━━━━━━
-✅ 6/9+ must pass for auto-signal!
+✅ 5/9+ must pass for auto-signal!
 "No checklist = random trading"
 """
 
@@ -836,8 +844,8 @@ async def auto_generate_signal(context, price):
             best_direction = direction
             best_checks = checks
     
-    # 6. SIGNAL THRESHOLD: 6/9+ to generate signal
-    MIN_CHECKLIST_SCORE = 6.0
+    # 6. SIGNAL THRESHOLD: 5/9+ to generate signal
+    MIN_CHECKLIST_SCORE = 5.0
     
     if best_score < MIN_CHECKLIST_SCORE or best_direction is None:
         return
@@ -1038,7 +1046,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     checklist_display = "\n".join([f"  {icon} {name}: {detail}" for icon, name, detail in best_checks])
     
-    status = "✅ SIGNAL READY!" if best_score >= 6.0 else "⏳ Not yet (need 6/9+)"
+    status = "✅ SIGNAL READY!" if best_score >= 5.0 else "⏳ Not yet (need 5/9+)"
     
     msg = f"""🔍 FORCED SCAN RESULT
 ━━━━━━━━━━━━━━━━━
@@ -1581,7 +1589,7 @@ async def scan_status_update(context: ContextTypes.DEFAULT_TYPE):
         sell_score, _, _ = run_smc_checklist(price, "SELL", prices_list)
         best = "BUY" if buy_score >= sell_score else "SELL"
         best_score = max(buy_score, sell_score)
-        checklist_preview = f"\n📋 Best: {best} ({best_score:.0f}/9) {'✅ READY!' if best_score >= 6 else '⏳ Need 6/9+'}"
+        checklist_preview = f"\n📋 Best: {best} ({best_score:.0f}/9) {'✅ READY!' if best_score >= 5 else '⏳ Need 5/9+'}"
     
     cooldown_str = ""
     if cooldown_until > _time.time():
@@ -1669,7 +1677,7 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
             best_score = max(buy_score, sell_score)
             best_checks = buy_checks if buy_score >= sell_score else sell_checks
             checklist_info = f"\n📋 Best setup: {best} ({best_score:.0f}/9)"
-            if best_score >= 6:
+            if best_score >= 5:
                 checklist_info += " ✅ Signal ready!"
                 # AUTO-TRIGGER signal generation if checklist passes!
                 if not is_daily_loss_limit_reached() and time.time() >= cooldown_until:

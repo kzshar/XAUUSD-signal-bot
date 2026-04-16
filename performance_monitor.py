@@ -45,7 +45,7 @@ PAWOO_MESSAGE_FILE  = os.path.join(BASE_DIR, "pawoo_message.json")
 MONITOR_STATE_FILE  = os.path.join(BASE_DIR, "monitor_state.json")
 
 # Analysis thresholds
-MIN_CHECKLIST_SCORE   = 6.0
+MIN_CHECKLIST_SCORE   = 5.0
 HIGH_SCORE_THRESHOLD  = 7.0
 WIN_RATE_GOOD         = 0.60
 WIN_RATE_POOR         = 0.40
