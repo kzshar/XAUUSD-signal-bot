@@ -889,9 +889,14 @@ async def auto_generate_signal(context, price):
 📸 Send H1 & M5 charts to ပေါ်ဦး for verification!
 ━━━━━━━━━━━━━━━━━"""
 
-    signal_id = str(int(time.time()))
+    signal_id = str(int(time.time()))[-8:]  # Short ID to save bytes
+    # Round prices to 2 decimal places to avoid float precision issues
+    e_r = round(entry, 2)
+    s_r = round(sl, 2)
+    t1_r = round(tp1, 2)
+    t2_r = round(tp2, 2)
     keyboard = [[
-        InlineKeyboardButton("✅ ဝင်မယ်", callback_data=f"enter_{direction}_{entry}_{sl}_{tp1}_{tp2}_{signal_id}"),
+        InlineKeyboardButton("✅ ဝင်မယ်", callback_data=f"e_{direction}_{e_r}_{s_r}_{t1_r}_{t2_r}_{signal_id}"),
         InlineKeyboardButton("❌ Skip", callback_data=f"skip_{signal_id}"),
         InlineKeyboardButton("⏰ Wait", callback_data=f"wait_{signal_id}")
     ]]
@@ -1181,10 +1186,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=query.message.text + "\n\n❌ Signal Skipped")
         return
 
-    if query.data.startswith("enter"):
+    if query.data.startswith("e_") or query.data.startswith("enter_"):
         active_signal_msg_id = None
         parts = query.data.split("_")
-        _, direction, entry, sl, tp1, tp2 = parts[:6]
+        if query.data.startswith("e_"):
+            _, direction, entry, sl, tp1, tp2 = parts[:6]
+            sig_id_parts = parts[6:]
+        else:
+            _, direction, entry, sl, tp1, tp2 = parts[:6]
+            sig_id_parts = parts[6:]
         sig_id = parts[6] if len(parts) > 6 else None
         
         lot_size, streak = get_current_scaling()
