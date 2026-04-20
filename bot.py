@@ -531,9 +531,10 @@ def is_market_open():
     now = get_dubai_now()
     weekday = now.weekday()
     hour = now.hour
-    if weekday == 6: return hour >= 22
-    if weekday == 4: return hour < 23
-    return weekday < 4
+    if weekday == 6: return hour >= 22  # Sunday: market opens 10pm
+    if weekday == 5: return False  # Saturday: market closed
+    if weekday == 4: return hour < 23  # Friday: closes 11pm
+    return True  # Mon-Thu: market open
 
 async def fetch_gold_price():
     global cached_price, last_fetch_time
@@ -594,17 +595,11 @@ async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
     if not price:
         return
     
-    # COLD START: If we don't have enough data, fill with synthetic ticks
+    # COLD START: Just add real price, wait for enough real data
+    price_history.append(price)
     if len(price_history) < 20:
-        import random
-        logger.info(f"Cold start: filling price history ({len(price_history)}/20) from ${price:,.2f}")
-        needed = 25 - len(price_history)
-        for i in range(needed):
-            # Simulate recent price movement around current price
-            tick = price + random.uniform(-2.0, 2.0)
-            price_history.append(tick)
-        price_history.append(price)  # Ensure latest is actual price
-        logger.info(f"Cold start complete: {len(price_history)} samples")
+        logger.info(f"Building price history: {len(price_history)}/20 (need real data, no fake ticks)")
+        return
 
     if active_trade:
         await manage_active_trades(context, price)
@@ -767,6 +762,11 @@ async def auto_generate_signal(context, price):
     global active_signal_msg_id, active_trade, cooldown_until
     if active_signal_msg_id or active_trade:
         logger.info(f"Signal skip: active_signal={active_signal_msg_id is not None}, active_trade={active_trade is not None}")
+        return
+
+    # 0. Market Open Check
+    if not is_market_open():
+        logger.info("Signal skip: market is CLOSED")
         return
 
     # 1. Cooldown Check
@@ -1028,6 +1028,11 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force an immediate market scan and report results."""
+    if not is_market_open():
+        price = await fetch_gold_price()
+        price_str = f"${price:,.2f}" if price else "N/A"
+        await update.message.reply_text(f"⚠️ Market CLOSED! Gold: {price_str}\nSignal generation disabled until market opens.")
+        return
     price = await fetch_gold_price()
     if not price:
         await update.message.reply_text("❌ Cannot fetch gold price right now.")
@@ -1138,11 +1143,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cooldown_rem = int((cooldown_until - time.time()) / 60)
     cooldown_str = f"⏳ Cooldown: {cooldown_rem} min remaining" if cooldown_rem > 0 else "✅ Ready"
 
-    msg = f"""🤖 ပေါ်ဦး Signal Bot v2.0 - Status
+    msg = f"""🤖 ပေါ်ဦး Signal Bot v3.1 - Status
 ━━━━━━━━━━━━━━━━━
 🏦 XM Global | GOLDm# Micro
 📊 Lot: {lot_size} | 1pt=$0.005
-📋 Signal: Real SMC Checklist 6/9+
+📋 Signal: Real SMC Checklist 5/9+
 
 📅 Today ({today})
 📊 Trades: {len(counted_today)}/{MAX_DAILY_TRADES}
@@ -1648,22 +1653,10 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
 
     # --- Detect update/status queries => WAKE UP + FULL SCAN ---
     if any(w in text for w in ['any update', 'update', 'status', 'scanning', 'still scanning', 'what happening', 'any signal', 'any setup', 'found anything', 'any trade', 'ရှာနေလား', 'ဘာဖြစ်', 'signal ရှိလား', 'hi', 'hello', 'yo', 'bot']):
-        # WAKE UP: Rapidly collect price data if we don't have enough
+        # WAKE UP: Fetch current price
         price = await fetch_gold_price()
-        if price and len(price_history) < 20:
-            await update.message.reply_text(f"🔄 ပေါ်ဦး waking up! Gold: ${price:,.2f}\nCollecting market data... ခဏစောင့်ပါ!")
-            # Rapid data collection - fetch price multiple times to build history
-            for i in range(25):
-                last_fetch_time = 0  # Force fresh fetch
-                p = await fetch_gold_price()
-                if p:
-                    # Add small random variation to simulate real ticks
-                    import random
-                    for _ in range(2):
-                        tick = p + random.uniform(-0.5, 0.5)
-                        price_history.append(tick)
-                await asyncio.sleep(0.3)
-            price = await fetch_gold_price()
+        if price:
+            price_history.append(price)
         
         price_str = f"${price:,.2f}" if price else "N/A"
         today_str = get_dubai_now().date().isoformat()
@@ -1689,11 +1682,12 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
             checklist_info = f"\n📋 Best setup: {best} ({best_score:.0f}/9)"
             if best_score >= 5:
                 checklist_info += " ✅ Signal ready!"
-                # AUTO-TRIGGER signal generation if checklist passes!
-                if not is_daily_loss_limit_reached() and time.time() >= cooldown_until:
+                # AUTO-TRIGGER signal generation if checklist passes AND market is open!
+                if is_market_open() and not is_daily_loss_limit_reached() and time.time() >= cooldown_until:
                     signal_triggered = True
-                    # Trigger signal generation in background
                     asyncio.create_task(auto_generate_signal(context, price))
+                elif not is_market_open():
+                    checklist_info += " (Market CLOSED - no signal)"
             else:
                 checklist_info += f" ⏳ Need {6-best_score:.0f} more"
         elif len(prices_list) < 20:
@@ -1814,9 +1808,11 @@ async def check_coordinator_message(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🔒 Daily loss limit re-enabled.")
             elif action == 'force_scan':
                 price = await fetch_gold_price()
-                if price:
+                if price and is_market_open():
                     await auto_generate_signal(context, price)
                     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🔍 Force scan completed! Gold: ${price:,.2f}")
+                elif price and not is_market_open():
+                    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ Market CLOSED! Gold: ${price:,.2f} - No signal generated.")
             
             if msg:
                 await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
@@ -1864,10 +1860,11 @@ def main():
     
     # Scheduled jobs
     application.job_queue.run_repeating(monitor_market, interval=30, first=10)
-    application.job_queue.run_repeating(scan_status_update, interval=900, first=900)
+    # Reduced spam: scan status every 60 min instead of 15 min
+    application.job_queue.run_repeating(scan_status_update, interval=3600, first=3600)
     application.job_queue.run_repeating(check_coordinator_message, interval=5, first=5)
     
-    logger.info("ပေါ်ဦး Signal Bot v2.0 started - SMC POWERED!")
+    logger.info("ပေါ်ဦး Signal Bot v3.1 started - SMC POWERED! Market-close guard ON, no fake data!")
     application.run_polling(poll_interval=0.3)
 
 if __name__ == "__main__":
