@@ -67,9 +67,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global variables
-price_history = deque(maxlen=500)  # Increased for better analysis
+price_history = deque(maxlen=500)  # Spot price ticks for trade monitoring
 cached_price = None
 last_fetch_time = 0
+
+# REAL OHLC CANDLE DATA from Yahoo Finance
+candles_m5 = []   # M5 candles: [{time, open, high, low, close}, ...]
+candles_m15 = []  # M15 candles
+candles_h1 = []   # H1 candles
+last_candle_fetch = 0
+CANDLE_FETCH_INTERVAL = 300  # Fetch candles every 5 minutes
 trade_history = []
 signal_log = []
 daily_journal = {}
@@ -79,6 +86,7 @@ active_trade = None
 cooldown_until = 0
 last_scan_update_time = 0
 SCAN_UPDATE_INTERVAL = 900
+last_weekly_review_time = 0
 
 # ============================================================
 # DYNAMIC KEY LEVELS - Updated for current price range
@@ -90,6 +98,80 @@ KEY_LEVELS = {
     "demand_zones": [(4780, 4800), (4750, 4770), (4700, 4730)],
     "supply_zones": [(4835, 4850), (4870, 4900), (4950, 4970)]
 }
+
+# ============================================================
+# YAHOO FINANCE OHLC CANDLE DATA
+# ============================================================
+
+def fetch_candle_data():
+    """Fetch real OHLC candle data from Yahoo Finance.
+    M5: 1-day range, 5min interval
+    M15: 5-day range, 15min interval  
+    H1: 5-day range, 1h interval
+    """
+    global candles_m5, candles_m15, candles_h1, last_candle_fetch
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    def parse_yahoo_candles(url):
+        try:
+            resp = requests.get(url, timeout=10, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data['chart']['result'][0]
+                timestamps = result.get('timestamp', [])
+                quotes = result['indicators']['quote'][0]
+                candles = []
+                for i in range(len(timestamps)):
+                    o = quotes['open'][i]
+                    h = quotes['high'][i]
+                    l = quotes['low'][i]
+                    c = quotes['close'][i]
+                    if o and h and l and c:  # Skip None values
+                        candles.append({
+                            'time': timestamps[i],
+                            'open': float(o),
+                            'high': float(h),
+                            'low': float(l),
+                            'close': float(c)
+                        })
+                return candles
+            elif resp.status_code == 429:
+                logger.warning(f"Yahoo rate limited for {url}")
+        except Exception as e:
+            logger.error(f"Yahoo candle fetch error: {e}")
+        return None
+    
+    # Fetch M5 candles
+    m5 = parse_yahoo_candles('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=2d&interval=5m')
+    if m5 and len(m5) > 10:
+        candles_m5 = m5
+        logger.info(f"Fetched {len(m5)} M5 candles")
+    
+    # Fetch M15 candles
+    m15 = parse_yahoo_candles('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=5d&interval=15m')
+    if m15 and len(m15) > 10:
+        candles_m15 = m15
+        logger.info(f"Fetched {len(m15)} M15 candles")
+    
+    # Fetch H1 candles
+    h1 = parse_yahoo_candles('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=5d&interval=1h')
+    if h1 and len(h1) > 10:
+        candles_h1 = h1
+        logger.info(f"Fetched {len(h1)} H1 candles")
+    
+    last_candle_fetch = time.time()
+    logger.info(f"Candle data: M5={len(candles_m5)}, M15={len(candles_m15)}, H1={len(candles_h1)}")
+
+def get_candle_closes(candles):
+    """Extract close prices from candle list."""
+    return [c['close'] for c in candles]
+
+def get_candle_highs(candles):
+    return [c['high'] for c in candles]
+
+def get_candle_lows(candles):
+    return [c['low'] for c in candles]
 
 # ============================================================
 # SMC ANALYSIS ENGINE - Real market structure analysis
@@ -111,36 +193,39 @@ def get_price_swings(prices, lookback=5):
             swings["lows"].append({"index": i, "price": prices[i]})
     return swings
 
-def detect_htf_trend(prices):
-    """Detect Higher Timeframe trend using swing structure.
+def detect_htf_trend(prices=None):
+    """Detect Higher Timeframe trend using H1 candle swing structure.
+    Uses H1 candles for real HTF analysis.
     Returns: 'BULLISH', 'BEARISH', or 'RANGING'
     """
-    if len(prices) < 30:
+    # Use H1 candle closes for HTF trend
+    if candles_h1 and len(candles_h1) >= 20:
+        closes = get_candle_closes(candles_h1)
+    elif prices and len(prices) >= 30:
+        closes = list(prices)
+    else:
         return "UNKNOWN"
     
-    swings = get_price_swings(prices, lookback=3)
+    swings = get_price_swings(closes, lookback=3)
     highs = swings["highs"]
     lows = swings["lows"]
     
-    # Need at least 2 highs and 2 lows
     if len(highs) < 2 or len(lows) < 2:
-        # Fallback: use simple MA comparison
-        ma_short = sum(prices[-20:]) / 20 if len(prices) >= 20 else prices[-1]
-        ma_long = sum(prices[-50:]) / 50 if len(prices) >= 50 else prices[-1]
+        ma_short = sum(closes[-20:]) / 20
+        ma_long = sum(closes[-50:]) / 50 if len(closes) >= 50 else sum(closes) / len(closes)
         if ma_short > ma_long + 1:
             return "BULLISH"
         elif ma_short < ma_long - 1:
             return "BEARISH"
         return "RANGING"
     
-    # Check last 2 swing highs and lows
     last_2_highs = [h["price"] for h in highs[-2:]]
     last_2_lows = [l["price"] for l in lows[-2:]]
     
-    hh = last_2_highs[-1] > last_2_highs[-2]  # Higher High
-    hl = last_2_lows[-1] > last_2_lows[-2]     # Higher Low
-    lh = last_2_highs[-1] < last_2_highs[-2]   # Lower High
-    ll = last_2_lows[-1] < last_2_lows[-2]      # Lower Low
+    hh = last_2_highs[-1] > last_2_highs[-2]
+    hl = last_2_lows[-1] > last_2_lows[-2]
+    lh = last_2_highs[-1] < last_2_highs[-2]
+    ll = last_2_lows[-1] < last_2_lows[-2]
     
     if hh and hl:
         return "BULLISH"
@@ -149,15 +234,20 @@ def detect_htf_trend(prices):
     return "RANGING"
 
 def detect_bos(prices, direction):
-    """Detect Break of Structure.
+    """Detect Break of Structure using M5 candle closes.
     BUY: price breaks above recent swing high
     SELL: price breaks below recent swing low
     """
-    if len(prices) < 20:
+    # Use M5 candle closes for BOS
+    if candles_m5 and len(candles_m5) >= 20:
+        closes = get_candle_closes(candles_m5)
+    elif len(prices) >= 20:
+        closes = list(prices)
+    else:
         return False, None
     
-    swings = get_price_swings(prices[:-1], lookback=3)  # Exclude current price
-    current = prices[-1]
+    swings = get_price_swings(closes[:-1], lookback=3)
+    current = closes[-1]
     
     if direction == "BUY" and swings["highs"]:
         last_high = swings["highs"][-1]["price"]
@@ -170,83 +260,124 @@ def detect_bos(prices, direction):
     
     return False, None
 
-def detect_displacement(prices, lookback=5):
-    """Detect strong displacement (big body candles / strong momentum).
+def detect_displacement(prices=None, lookback=5):
+    """Detect strong displacement using M5 candle body sizes.
+    Compares recent candle bodies to average body size.
     Returns magnitude of displacement.
     """
-    if len(prices) < lookback:
+    if candles_m5 and len(candles_m5) >= lookback + 10:
+        # Use real candle body sizes
+        recent = candles_m5[-lookback:]
+        recent_bodies = [abs(c['close'] - c['open']) for c in recent]
+        max_body = max(recent_bodies) if recent_bodies else 0
+        
+        all_bodies = [abs(c['close'] - c['open']) for c in candles_m5[:-lookback]]
+        avg_body = sum(all_bodies) / len(all_bodies) if all_bodies else 1.0
+        
+        return max_body / avg_body if avg_body > 0 else 0.0
+    
+    # Fallback to price list
+    if not prices or len(prices) < lookback:
         return 0.0
     recent = list(prices)[-lookback:]
     move = abs(recent[-1] - recent[0])
-    # Compare to average move
     avg_moves = []
     all_prices = list(prices)
     for i in range(lookback, len(all_prices)):
         avg_moves.append(abs(all_prices[i] - all_prices[i-lookback]))
     avg_move = sum(avg_moves) / len(avg_moves) if avg_moves else 1.0
-    
     return move / avg_move if avg_move > 0 else 0.0
 
 def detect_liquidity_sweep(prices, direction):
-    """Detect if liquidity has been swept (price went past a level then reversed).
-    BUY: price dipped below recent low then came back up
-    SELL: price spiked above recent high then came back down
+    """Detect liquidity sweep using M5 candle wicks.
+    BUY: wick below recent swing low then close back above (stop hunt)
+    SELL: wick above recent swing high then close back below
     """
-    if len(prices) < 30:
+    if candles_m5 and len(candles_m5) >= 30:
+        recent = candles_m5[-30:]
+        lows = [c['low'] for c in recent]
+        highs = [c['high'] for c in recent]
+        closes = [c['close'] for c in recent]
+        current_close = closes[-1]
+        
+        if direction == "BUY":
+            # Check if a recent wick went below prior lows then closed above
+            prior_low = min(lows[:-10])
+            recent_low = min(lows[-10:])
+            if recent_low < prior_low and current_close > prior_low:
+                return True
+            # Check near support/demand zones
+            for s in KEY_LEVELS["support"]:
+                if recent_low <= s + 2 and current_close > s:
+                    return True
+        elif direction == "SELL":
+            prior_high = max(highs[:-10])
+            recent_high = max(highs[-10:])
+            if recent_high > prior_high and current_close < prior_high:
+                return True
+            for r in KEY_LEVELS["resistance"]:
+                if recent_high >= r - 2 and current_close < r:
+                    return True
         return False
     
+    # Fallback
+    if len(prices) < 30:
+        return False
     recent = list(prices)[-30:]
     current = recent[-1]
-    
     if direction == "BUY":
-        # Find recent low, check if price went below it then bounced
         min_price = min(recent[:-5])
         recent_min = min(recent[-10:])
         if recent_min <= min_price and current > recent_min + 0.5:
             return True
-        # Also check: price dipped near a support/demand zone
-        for s in KEY_LEVELS["support"]:
-            if recent_min <= s + 2 and current > s:
-                return True
     elif direction == "SELL":
-        # Find recent high, check if price went above it then dropped
         max_price = max(recent[:-5])
         recent_max = max(recent[-10:])
         if recent_max >= max_price and current < recent_max - 0.5:
             return True
-        # Also check: price spiked near a resistance/supply zone
-        for r in KEY_LEVELS["resistance"]:
-            if recent_max >= r - 2 and current < r:
-                return True
-    
     return False
 
 def find_order_block(prices, direction):
-    """Find potential Order Block zone.
-    BUY OB: Last bearish candle before bullish displacement
-    SELL OB: Last bullish candle before bearish displacement
+    """Find Order Block using M5 candle OHLC data.
+    BUY OB: Last bearish candle before bullish impulse
+    SELL OB: Last bullish candle before bearish impulse
     Returns (ob_low, ob_high) or None
     """
-    if len(prices) < 20:
+    if candles_m5 and len(candles_m5) >= 20:
+        recent = candles_m5[-20:]
+        
+        if direction == "BUY":
+            for i in range(len(recent)-3, 2, -1):
+                # Bearish candle (close < open)
+                if recent[i]['close'] < recent[i]['open']:
+                    # Followed by bullish impulse
+                    impulse_move = recent[min(i+3, len(recent)-1)]['close'] - recent[i]['close']
+                    if impulse_move > 2.0:
+                        return (recent[i]['low'], recent[i]['open'])
+        elif direction == "SELL":
+            for i in range(len(recent)-3, 2, -1):
+                # Bullish candle (close > open)
+                if recent[i]['close'] > recent[i]['open']:
+                    # Followed by bearish impulse
+                    impulse_move = recent[i]['close'] - recent[min(i+3, len(recent)-1)]['close']
+                    if impulse_move > 2.0:
+                        return (recent[i]['open'], recent[i]['high'])
         return None
     
+    # Fallback
+    if len(prices) < 20:
+        return None
     recent = list(prices)[-20:]
-    
     if direction == "BUY":
-        # Look for a drop followed by a strong rise
         for i in range(len(recent)-5, 4, -1):
-            if recent[i] < recent[i-1]:  # Bearish move
-                # Check if followed by bullish displacement
+            if recent[i] < recent[i-1]:
                 if recent[min(i+3, len(recent)-1)] > recent[i] + 2.0:
                     return (recent[i] - 1.0, recent[i-1])
     elif direction == "SELL":
-        # Look for a rise followed by a strong drop
         for i in range(len(recent)-5, 4, -1):
-            if recent[i] > recent[i-1]:  # Bullish move
-                # Check if followed by bearish displacement
+            if recent[i] > recent[i-1]:
                 if recent[min(i+3, len(recent)-1)] < recent[i] - 2.0:
                     return (recent[i-1], recent[i] + 1.0)
-    
     return None
 
 def is_near_key_level(price, direction):
@@ -265,14 +396,21 @@ def is_near_key_level(price, direction):
 
 def is_premium_discount(price, direction):
     """Check if price is in premium (for sells) or discount (for buys) zone.
-    Uses recent range to determine.
+    Uses M5 candle highs/lows for accurate range calculation.
     """
-    if len(price_history) < 50:
+    # Use M5 candle data for range calculation
+    if candles_m5 and len(candles_m5) >= 50:
+        highs = get_candle_highs(candles_m5[-100:])
+        lows = get_candle_lows(candles_m5[-100:])
+        range_high = max(highs)
+        range_low = min(lows)
+    elif len(price_history) >= 50:
+        recent = list(price_history)[-100:]
+        range_high = max(recent)
+        range_low = min(recent)
+    else:
         return True  # Can't determine, pass
     
-    recent = list(price_history)[-100:]
-    range_high = max(recent)
-    range_low = min(recent)
     mid = (range_high + range_low) / 2
     
     if direction == "BUY" and price < mid:
@@ -282,13 +420,18 @@ def is_premium_discount(price, direction):
     return False
 
 def calculate_rsi(period=14):
-    """Calculate RSI from price history."""
-    if len(price_history) < period + 1:
+    """Calculate RSI from M5 candle close prices (real candle RSI)."""
+    # Use M5 candle closes for accurate RSI
+    if candles_m5 and len(candles_m5) >= period + 1:
+        closes = get_candle_closes(candles_m5)[-(period+1):]
+    elif len(price_history) >= period + 1:
+        closes = list(price_history)[-(period+1):]
+    else:
         return 50.0
-    prices = list(price_history)[-(period+1):]
+    
     gains, losses = [], []
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i-1]
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
     avg_gain = sum(gains) / period
@@ -299,6 +442,10 @@ def calculate_rsi(period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def calculate_ma(period):
+    """Calculate Moving Average from M5 candle closes."""
+    if candles_m5 and len(candles_m5) >= period:
+        closes = get_candle_closes(candles_m5[-period:])
+        return sum(closes) / len(closes)
     if len(price_history) < period:
         return None
     return sum(list(price_history)[-period:]) / period
@@ -588,25 +735,32 @@ def is_daily_loss_limit_reached():
 # ============================================================
 
 async def monitor_market(context: ContextTypes.DEFAULT_TYPE):
-    global last_fetch_time
+    global last_fetch_time, last_candle_fetch
     if not is_market_open():
         return
     price = await fetch_gold_price()
     if not price:
         return
     
-    # COLD START: Just add real price, wait for enough real data
-    price_history.append(price)
-    if len(price_history) < 20:
-        logger.info(f"Building price history: {len(price_history)}/20 (need real data, no fake ticks)")
+    # Fetch OHLC candle data from Yahoo Finance (every 5 min)
+    now = time.time()
+    if now - last_candle_fetch >= CANDLE_FETCH_INTERVAL or len(candles_m5) == 0:
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, fetch_candle_data)
+        except Exception as e:
+            logger.error(f"Candle fetch error in monitor: {e}")
+    
+    # Need at least 20 M5 candles for proper analysis
+    if len(candles_m5) < 20:
+        logger.info(f"Building candle data: M5={len(candles_m5)}/20, H1={len(candles_h1)}")
         return
 
     if active_trade:
         await manage_active_trades(context, price)
     else:
-        # Scan with SMC checklist
-        if len(price_history) >= 20:
-            await auto_generate_signal(context, price)
+        # Scan with SMC checklist using real candle data
+        await auto_generate_signal(context, price)
 
 async def manage_active_trades(context, price):
     global active_trade
@@ -788,19 +942,24 @@ async def auto_generate_signal(context, price):
         logger.info(f"Signal skip: daily trade limit ({entered_today}/{MAX_DAILY_TRADES})")
         return
 
-    prices_list = list(price_history)
-    if len(prices_list) < 20:
-        logger.info(f"Signal skip: not enough price data ({len(prices_list)}/20)")
-        return
+    # Use candle data for analysis (fallback to price_history)
+    if len(candles_m5) < 20:
+        prices_list = list(price_history)
+        if len(prices_list) < 20:
+            logger.info(f"Signal skip: not enough data (M5={len(candles_m5)}, ticks={len(prices_list)})")
+            return
+    else:
+        prices_list = get_candle_closes(candles_m5)
     
-    logger.info(f"Signal scan: price=${price:,.2f}, data={len(prices_list)}, trades={entered_today}/{MAX_DAILY_TRADES}, override={LOSS_OVERRIDE_ACTIVE}")
+    logger.info(f"Signal scan: price=${price:,.2f}, M5={len(candles_m5)}, H1={len(candles_h1)}, trades={entered_today}/{MAX_DAILY_TRADES}, override={LOSS_OVERRIDE_ACTIVE}")
 
     # 4. Determine potential direction based on market structure
     trend = detect_htf_trend(prices_list)
     
-    # Calculate short-term momentum
-    if len(prices_list) >= 10:
-        short_change = prices_list[-1] - prices_list[-10]
+    # Calculate short-term momentum from M5 candle closes
+    m5_closes = get_candle_closes(candles_m5) if candles_m5 else list(price_history)
+    if len(m5_closes) >= 10:
+        short_change = m5_closes[-1] - m5_closes[-10]
     else:
         short_change = 0
     
@@ -886,6 +1045,7 @@ async def auto_generate_signal(context, price):
 
 🏦 XM Micro | {lot_size} lot | 1pt=$0.005
 ⏰ Session: {session}
+📡 Data: {len(candles_m5)} M5 + {len(candles_h1)} H1 candles
 📸 Send H1 & M5 charts to ပေါ်ဦး for verification!
 ━━━━━━━━━━━━━━━━━"""
 
@@ -970,11 +1130,12 @@ async def check_missed_signal(context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = await fetch_gold_price()
-    welcome = f"""🤖 ပေါ်ဦး Signal Bot v2.0 - SMC POWERED!
+    welcome = f"""🤖 ပေါ်ဦး Signal Bot v3.2 - SMC + Real Candles!
 Mingalabar Khine ရ! ပေါ်ဦး real SMC analysis နဲ့ စောင့်ကြည့်ပေးနေမယ် 🏆
 
 📊 Current Gold Price: ${price:,.2f}
-📋 Signal Threshold: 6/9+ SMC Checklist
+📊 Signal Threshold: 5/9+ SMC Checklist
+📡 Data: Yahoo Finance OHLC Candles (M5+H1)
 
 Available Commands:
 /price - Current gold price
@@ -997,14 +1158,16 @@ Available Commands:
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = await fetch_gold_price()
     rsi = calculate_rsi(14)
-    trend = detect_htf_trend(list(price_history)) if len(price_history) >= 30 else "UNKNOWN"
+    trend = detect_htf_trend() if len(candles_h1) >= 20 else "UNKNOWN"
     
-    if len(price_history) >= 10:
-        change = price - list(price_history)[-10]
+    m5_closes = get_candle_closes(candles_m5) if candles_m5 else list(price_history)
+    if len(m5_closes) >= 10:
+        change = m5_closes[-1] - m5_closes[-10]
         trend_arrow = "📈 UP" if change > 0 else "📉 DOWN"
-        await update.message.reply_text(f"📊 Gold: ${price:,.2f}\nTrend (5m): {trend_arrow} (${abs(change):.2f})\nHTF: {trend} | RSI: {rsi:.1f}")
+        data_src = "candles" if candles_m5 else "ticks"
+        await update.message.reply_text(f"📊 Gold: ${price:,.2f}\nTrend (M5): {trend_arrow} (${abs(change):.2f})\nHTF: {trend} | RSI(14): {rsi:.1f}\n📡 Data: {len(candles_m5)} M5 {data_src}")
     else:
-        await update.message.reply_text(f"📊 Gold: ${price:,.2f} | RSI: {rsi:.1f}")
+        await update.message.reply_text(f"📊 Gold: ${price:,.2f} | RSI(14): {rsi:.1f}")
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global cooldown_until
@@ -1038,13 +1201,20 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cannot fetch gold price right now.")
         return
     
-    prices_list = list(price_history)
+    # Fetch fresh candle data for scan
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, fetch_candle_data)
+    except Exception as e:
+        logger.error(f"Candle fetch error in scan: {e}")
+    
+    prices_list = get_candle_closes(candles_m5) if len(candles_m5) >= 20 else list(price_history)
     if len(prices_list) < 20:
-        await update.message.reply_text(f"📊 Gold: ${price:,.2f}\n⏳ Need more price data ({len(prices_list)}/20 samples). Bot is collecting...")
+        await update.message.reply_text(f"📊 Gold: ${price:,.2f}\n⏳ Need more data (M5={len(candles_m5)}, ticks={len(price_history)}). Collecting...")
         return
     
     rsi = calculate_rsi(14)
-    trend = detect_htf_trend(prices_list)
+    trend = detect_htf_trend() if len(candles_h1) >= 20 else detect_htf_trend(prices_list)
     
     # Run checklist for both directions
     buy_score, _, buy_checks = run_smc_checklist(price, "BUY", prices_list)
@@ -1058,10 +1228,12 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status = "✅ SIGNAL READY!" if best_score >= 5.0 else "⏳ Not yet (need 5/9+)"
     
+    data_src = f"M5={len(candles_m5)} H1={len(candles_h1)} candles" if candles_m5 else "spot ticks"
     msg = f"""🔍 FORCED SCAN RESULT
 ━━━━━━━━━━━━━━━━━
-📊 Gold: ${price:,.2f} | RSI: {rsi:.1f}
+📊 Gold: ${price:,.2f} | RSI(14): {rsi:.1f}
 📈 HTF Trend: {trend}
+📡 Data: {data_src}
 
 Best Setup: {best_dir} ({best_score:.0f}/9)
 {checklist_display}
@@ -1143,7 +1315,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cooldown_rem = int((cooldown_until - time.time()) / 60)
     cooldown_str = f"⏳ Cooldown: {cooldown_rem} min remaining" if cooldown_rem > 0 else "✅ Ready"
 
-    msg = f"""🤖 ပေါ်ဦး Signal Bot v3.1 - Status
+    msg = f"""🤖 ပေါ်ဦး Signal Bot v3.2 - Status
 ━━━━━━━━━━━━━━━━━
 🏦 XM Global | GOLDm# Micro
 📊 Lot: {lot_size} | 1pt=$0.005
@@ -1583,6 +1755,13 @@ async def scan_status_update(context: ContextTypes.DEFAULT_TYPE):
     if not price:
         return
     
+    # Refresh candle data for status update
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, fetch_candle_data)
+    except Exception as e:
+        logger.error(f"Candle fetch error in scan_status: {e}")
+    
     now = get_dubai_now()
     today = now.date().isoformat()
     
@@ -1594,10 +1773,10 @@ async def scan_status_update(context: ContextTypes.DEFAULT_TYPE):
     remaining = MAX_DAILY_TRADES - len(counted)
     
     rsi = calculate_rsi(14)
-    trend = detect_htf_trend(list(price_history)) if len(price_history) >= 30 else "UNKNOWN"
+    trend = detect_htf_trend() if len(candles_h1) >= 20 else (detect_htf_trend(list(price_history)) if len(price_history) >= 30 else "UNKNOWN")
     
     # Quick checklist preview
-    prices_list = list(price_history)
+    prices_list = get_candle_closes(candles_m5) if len(candles_m5) >= 20 else list(price_history)
     checklist_preview = ""
     if len(prices_list) >= 20:
         buy_score, _, _ = run_smc_checklist(price, "BUY", prices_list)
@@ -1625,6 +1804,7 @@ async def scan_status_update(context: ContextTypes.DEFAULT_TYPE):
 💰 P&L: ${daily_pnl:+.2f}{cooldown_str}{checklist_preview}
 
 🔎 ပေါ်ဦး SMC analysis နဲ့ ရှာနေတယ်...
+📡 Data: M5={len(candles_m5)} H1={len(candles_h1)} candles
 ပိုင်မှဝင်! 💪"""
     
     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
@@ -1653,10 +1833,17 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
 
     # --- Detect update/status queries => WAKE UP + FULL SCAN ---
     if any(w in text for w in ['any update', 'update', 'status', 'scanning', 'still scanning', 'what happening', 'any signal', 'any setup', 'found anything', 'any trade', 'ရှာနေလား', 'ဘာဖြစ်', 'signal ရှိလား', 'hi', 'hello', 'yo', 'bot']):
-        # WAKE UP: Fetch current price
+        # WAKE UP: Fetch current price AND candle data
         price = await fetch_gold_price()
         if price:
             price_history.append(price)
+        
+        # Fetch fresh candle data on wake-up
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, fetch_candle_data)
+        except Exception as e:
+            logger.error(f"Candle fetch error on wake-up: {e}")
         
         price_str = f"${price:,.2f}" if price else "N/A"
         today_str = get_dubai_now().date().isoformat()
@@ -1667,12 +1854,12 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
         remaining = MAX_DAILY_TRADES - len(counted)
         
         rsi = calculate_rsi(14)
-        trend = detect_htf_trend(list(price_history)) if len(price_history) >= 30 else "UNKNOWN"
+        trend = detect_htf_trend() if len(candles_h1) >= 20 else "UNKNOWN"
         
         # FULL SCAN: Run SMC checklist immediately
         checklist_info = ""
         signal_triggered = False
-        prices_list = list(price_history)
+        prices_list = get_candle_closes(candles_m5) if len(candles_m5) >= 20 else list(price_history)
         if len(prices_list) >= 20 and not active_trade and not active_signal_msg_id:
             buy_score, _, buy_checks = run_smc_checklist(price, "BUY", prices_list)
             sell_score, _, sell_checks = run_smc_checklist(price, "SELL", prices_list)
@@ -1689,7 +1876,7 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
                 elif not is_market_open():
                     checklist_info += " (Market CLOSED - no signal)"
             else:
-                checklist_info += f" ⏳ Need {6-best_score:.0f} more"
+                checklist_info += f" ⏳ Need {5-best_score:.0f} more"
         elif len(prices_list) < 20:
             checklist_info = f"\n⏳ Building data: {len(prices_list)}/20 samples"
         
@@ -1717,7 +1904,8 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
 📊 Trades: {len(counted)}/{MAX_DAILY_TRADES} | W:{wins} L:{losses}
 🎯 Remaining: {remaining}{checklist_info}{trigger_str}
 
-🔎 ပေါ်ဦး SMC checklist 6/9+ ရှာနေတယ်...
+🔎 ပေါ်ဦး SMC checklist 5/9+ ရှာနေတယ်...
+📡 Data: M5={len(candles_m5)} H1={len(candles_h1)} candles
 Scanning every 30 seconds! ပိုင်မှဝင်! 💪
 ━━━━━━━━━━━━━━━━━"""
         await update.message.reply_text(msg)
@@ -1727,7 +1915,7 @@ Scanning every 30 seconds! ပိုင်မှဝင်! 💪
     if any(w in text for w in ['plan', 'next', 'what should i do', 'setup', 'market', 'analysis']):
         price = await fetch_gold_price()
         rsi = calculate_rsi(14)
-        trend = detect_htf_trend(list(price_history)) if len(price_history) >= 30 else "UNKNOWN"
+        trend = detect_htf_trend() if len(candles_h1) >= 20 else "UNKNOWN"
         
         nearest_support = min(KEY_LEVELS["support"], key=lambda x: abs(price - x))
         nearest_resistance = min(KEY_LEVELS["resistance"], key=lambda x: abs(price - x))
@@ -1808,6 +1996,10 @@ async def check_coordinator_message(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🔒 Daily loss limit re-enabled.")
             elif action == 'force_scan':
                 price = await fetch_gold_price()
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, fetch_candle_data)
+                except: pass
                 if price and is_market_open():
                     await auto_generate_signal(context, price)
                     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🔍 Force scan completed! Gold: ${price:,.2f}")
@@ -1864,7 +2056,7 @@ def main():
     application.job_queue.run_repeating(scan_status_update, interval=3600, first=3600)
     application.job_queue.run_repeating(check_coordinator_message, interval=5, first=5)
     
-    logger.info("ပေါ်ဦး Signal Bot v3.1 started - SMC POWERED! Market-close guard ON, no fake data!")
+    logger.info("ပေါ်ဦး Signal Bot v3.2 started - Real OHLC Candles from Yahoo Finance! RSI + SMC accuracy fixed!")
     application.run_polling(poll_interval=0.3)
 
 if __name__ == "__main__":
