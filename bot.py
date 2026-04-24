@@ -675,13 +675,25 @@ def get_dubai_now():
     return datetime.datetime.now(pytz.timezone('Asia/Dubai'))
 
 def is_market_open():
+    """Check if gold market is open.
+    Gold futures (CME COMEX) hours:
+    - Opens: Sunday 6pm ET = Monday 2:00 AM Dubai
+    - Closes: Friday 5pm ET = Saturday 1:00 AM Dubai
+    In Dubai timezone:
+    - Saturday: open until 1:00 AM (Friday NY session ending)
+    - Saturday 1:00 AM - Sunday: CLOSED
+    - Sunday 23:59 / Monday 2:00 AM: opens again
+    """
     now = get_dubai_now()
     weekday = now.weekday()
     hour = now.hour
-    if weekday == 6: return hour >= 22  # Sunday: market opens 10pm
-    if weekday == 5: return False  # Saturday: market closed
-    if weekday == 4: return hour < 23  # Friday: closes 11pm
-    return True  # Mon-Thu: market open
+    if weekday == 5:  # Saturday
+        return hour < 2  # Market still open until ~2AM Dubai (Friday 5pm ET + buffer)
+    if weekday == 6:  # Sunday
+        return hour >= 23  # Market opens ~11pm Dubai (Sunday 6pm ET + buffer)
+    if weekday == 0:  # Monday
+        return True  # Open all day after Sunday open
+    return True  # Tue-Fri: market open 24h
 
 async def fetch_gold_price():
     global cached_price, last_fetch_time
