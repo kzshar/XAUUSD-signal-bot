@@ -113,7 +113,7 @@ def fetch_candle_data():
     
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    def parse_yahoo_candles(url):
+    def parse_yahoo_candles(url, filter_settlement=True):
         try:
             resp = requests.get(url, timeout=10, headers=headers)
             if resp.status_code == 200:
@@ -128,12 +128,16 @@ def fetch_candle_data():
                     l = quotes['low'][i]
                     c = quotes['close'][i]
                     if o and h and l and c:  # Skip None values
+                        o, h, l, c = float(o), float(h), float(l), float(c)
+                        # Filter settlement candles (O=H=L=C, fake bar at market close)
+                        if filter_settlement and o == h == l == c:
+                            continue
                         candles.append({
                             'time': timestamps[i],
-                            'open': float(o),
-                            'high': float(h),
-                            'low': float(l),
-                            'close': float(c)
+                            'open': o,
+                            'high': h,
+                            'low': l,
+                            'close': c
                         })
                 return candles
             elif resp.status_code == 429:
@@ -142,8 +146,8 @@ def fetch_candle_data():
             logger.error(f"Yahoo candle fetch error: {e}")
         return None
     
-    # Fetch M5 candles
-    m5 = parse_yahoo_candles('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=2d&interval=5m')
+    # Fetch M5 candles (5d range for more data = better Wilder RSI smoothing)
+    m5 = parse_yahoo_candles('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=5d&interval=5m')
     if m5 and len(m5) > 10:
         candles_m5 = m5
         logger.info(f"Fetched {len(m5)} M5 candles")
@@ -420,22 +424,34 @@ def is_premium_discount(price, direction):
     return False
 
 def calculate_rsi(period=14):
-    """Calculate RSI from M5 candle close prices (real candle RSI)."""
-    # Use M5 candle closes for accurate RSI
-    if candles_m5 and len(candles_m5) >= period + 1:
-        closes = get_candle_closes(candles_m5)[-(period+1):]
+    """Calculate RSI using Wilder's smoothed method (same as MT5/TradingView).
+    Uses ALL available M5 candle closes for accurate smoothing.
+    """
+    # Use ALL M5 candle closes for proper Wilder smoothing
+    if candles_m5 and len(candles_m5) >= period + 10:
+        closes = get_candle_closes(candles_m5)
     elif len(price_history) >= period + 1:
-        closes = list(price_history)[-(period+1):]
+        closes = list(price_history)
     else:
         return 50.0
     
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    if len(closes) < period + 1:
+        return 50.0
+    
+    # Calculate price changes
+    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(c, 0) for c in changes]
+    losses = [max(-c, 0) for c in changes]
+    
+    # Initial SMA for first 'period' values
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    # Wilder's smoothing: avg = (prev_avg * (period-1) + current) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
