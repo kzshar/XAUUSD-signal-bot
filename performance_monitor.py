@@ -102,11 +102,15 @@ def today_str() -> str:
     return now_dubai().date().isoformat()
 
 def is_market_open() -> bool:
+    """Gold market hours (Dubai time):
+    Opens: Monday ~2AM (Sunday 6pm ET)
+    Closes: Saturday ~1-2AM (Friday 5pm ET)
+    """
     n = now_dubai()
     wd, h = n.weekday(), n.hour
-    if wd == 6: return h >= 22
-    if wd == 4: return h < 23
-    return wd < 5
+    if wd == 5: return h < 2   # Saturday: open until ~2AM Dubai
+    if wd == 6: return h >= 23  # Sunday: opens ~11PM Dubai
+    return True                 # Mon-Fri: open 24h
 
 
 # ─────────────────────────────────────────────────────────────
