@@ -71,12 +71,17 @@ price_history = deque(maxlen=500)  # Spot price ticks for trade monitoring
 cached_price = None
 last_fetch_time = 0
 
-# REAL OHLC CANDLE DATA from Yahoo Finance
-candles_m5 = []   # M5 candles: [{time, open, high, low, close}, ...]
+# REAL OHLC CANDLE DATA from Yahoo Finance (for SMC analysis)
+candles_m5 = []   # M5 candles from GC=F: [{time, open, high, low, close}, ...]
 candles_m15 = []  # M15 candles
 candles_h1 = []   # H1 candles
 last_candle_fetch = 0
 CANDLE_FETCH_INTERVAL = 300  # Fetch candles every 5 minutes
+
+# SPOT M5 CANDLES - Built from gold-api.com spot ticks (matches MT5/broker)
+spot_candles_m5 = []  # Spot M5 candles built from ticks
+spot_current_candle = None  # Current building candle {start_time, open, high, low, close, ticks}
+SPOT_CANDLE_FILE = os.path.join(DATA_DIR, 'spot_candles.json')  # Persist across restarts
 trade_history = []
 signal_log = []
 daily_journal = {}
@@ -166,6 +171,80 @@ def fetch_candle_data():
     
     last_candle_fetch = time.time()
     logger.info(f"Candle data: M5={len(candles_m5)}, M15={len(candles_m15)}, H1={len(candles_h1)}")
+
+# ============================================================
+# SPOT M5 CANDLE BUILDER - Build from gold-api.com ticks
+# ============================================================
+
+def add_spot_tick(price):
+    """Add a spot price tick and aggregate into M5 candles.
+    Called every time we fetch spot price (~30 seconds).
+    Builds real M5 OHLC candles from spot ticks to match MT5/broker RSI.
+    """
+    global spot_current_candle, spot_candles_m5
+    
+    now = time.time()
+    # Round down to nearest 5-minute boundary
+    candle_start = int(now // 300) * 300
+    
+    if spot_current_candle is None or spot_current_candle['start_time'] != candle_start:
+        # Close previous candle if exists
+        if spot_current_candle is not None and spot_current_candle['ticks'] > 0:
+            finished = {
+                'time': spot_current_candle['start_time'],
+                'open': spot_current_candle['open'],
+                'high': spot_current_candle['high'],
+                'low': spot_current_candle['low'],
+                'close': spot_current_candle['close']
+            }
+            spot_candles_m5.append(finished)
+            # Keep max 500 candles (~41 hours)
+            if len(spot_candles_m5) > 500:
+                spot_candles_m5 = spot_candles_m5[-500:]
+            save_spot_candles()
+        
+        # Start new candle
+        spot_current_candle = {
+            'start_time': candle_start,
+            'open': price,
+            'high': price,
+            'low': price,
+            'close': price,
+            'ticks': 1
+        }
+    else:
+        # Update current candle
+        spot_current_candle['high'] = max(spot_current_candle['high'], price)
+        spot_current_candle['low'] = min(spot_current_candle['low'], price)
+        spot_current_candle['close'] = price
+        spot_current_candle['ticks'] += 1
+
+def save_spot_candles():
+    """Persist spot candles to disk for survival across restarts."""
+    try:
+        with open(SPOT_CANDLE_FILE, 'w') as f:
+            json.dump(spot_candles_m5[-500:], f)
+    except Exception as e:
+        logger.error(f"Save spot candles error: {e}")
+
+def load_spot_candles():
+    """Load spot candles from disk on startup."""
+    global spot_candles_m5
+    try:
+        if os.path.exists(SPOT_CANDLE_FILE):
+            with open(SPOT_CANDLE_FILE) as f:
+                spot_candles_m5 = json.load(f)
+            logger.info(f"Loaded {len(spot_candles_m5)} spot M5 candles from disk")
+    except Exception as e:
+        logger.error(f"Load spot candles error: {e}")
+        spot_candles_m5 = []
+
+def get_spot_candle_closes():
+    """Get spot M5 candle closes including current building candle."""
+    closes = [c['close'] for c in spot_candles_m5]
+    if spot_current_candle and spot_current_candle['ticks'] > 0:
+        closes.append(spot_current_candle['close'])
+    return closes
 
 def get_candle_closes(candles):
     """Extract close prices from candle list."""
@@ -425,11 +504,17 @@ def is_premium_discount(price, direction):
 
 def calculate_rsi(period=14):
     """Calculate RSI using Wilder's smoothed method (same as MT5/TradingView).
-    Uses ALL available M5 candle closes for accurate smoothing.
+    Priority: 1) Spot M5 candles (matches MT5), 2) GC=F candles, 3) raw ticks
     """
-    # Use ALL M5 candle closes for proper Wilder smoothing
-    if candles_m5 and len(candles_m5) >= period + 10:
+    # BEST: Use spot M5 candles built from gold-api.com (matches MT5/broker)
+    spot_closes = get_spot_candle_closes()
+    if len(spot_closes) >= period + 10:
+        closes = spot_closes
+        logger.debug(f"RSI using {len(closes)} SPOT candles")
+    # FALLBACK: Use GC=F futures candles (slightly different from spot)
+    elif candles_m5 and len(candles_m5) >= period + 10:
         closes = get_candle_closes(candles_m5)
+        logger.debug(f"RSI using {len(closes)} GC=F candles (fallback)")
     elif len(price_history) >= period + 1:
         closes = list(price_history)
     else:
@@ -733,6 +818,9 @@ async def fetch_gold_price():
                 cached_price = price
                 last_fetch_time = now
                 price_history.append(price)
+                # Build spot M5 candles from spot price ticks
+                if "price" in data:  # Only from gold-api (spot price)
+                    add_spot_tick(price)
                 return price
         except:
             continue
@@ -1160,7 +1248,7 @@ async def check_missed_signal(context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = await fetch_gold_price()
-    welcome = f"""🤖 ပေါ်ဦး Signal Bot v3.2 - SMC + Real Candles!
+    welcome = f"""🤖 ပေါ်ဦး Signal Bot v3.3 - Spot RSI Match!
 Mingalabar Khine ရ! ပေါ်ဦး real SMC analysis နဲ့ စောင့်ကြည့်ပေးနေမယ် 🏆
 
 📊 Current Gold Price: ${price:,.2f}
@@ -1345,7 +1433,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cooldown_rem = int((cooldown_until - time.time()) / 60)
     cooldown_str = f"⏳ Cooldown: {cooldown_rem} min remaining" if cooldown_rem > 0 else "✅ Ready"
 
-    msg = f"""🤖 ပေါ်ဦး Signal Bot v3.2 - Status
+    msg = f"""🤖 ပေါ်ဦး Signal Bot v3.3 - Status
 ━━━━━━━━━━━━━━━━━
 🏦 XM Global | GOLDm# Micro
 📊 Lot: {lot_size} | 1pt=$0.005
@@ -1834,7 +1922,7 @@ async def scan_status_update(context: ContextTypes.DEFAULT_TYPE):
 💰 P&L: ${daily_pnl:+.2f}{cooldown_str}{checklist_preview}
 
 🔎 ပေါ်ဦး SMC analysis နဲ့ ရှာနေတယ်...
-📡 Data: M5={len(candles_m5)} H1={len(candles_h1)} candles
+📡 Data: Spot M5={len(spot_candles_m5)} | GC=F M5={len(candles_m5)} H1={len(candles_h1)}
 ပိုင်မှဝင်! 💪"""
     
     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
@@ -1935,7 +2023,7 @@ async def general_message_handler(update: Update, context: ContextTypes.DEFAULT_
 🎯 Remaining: {remaining}{checklist_info}{trigger_str}
 
 🔎 ပေါ်ဦး SMC checklist 5/9+ ရှာနေတယ်...
-📡 Data: M5={len(candles_m5)} H1={len(candles_h1)} candles
+📡 Data: Spot M5={len(spot_candles_m5)} | GC=F M5={len(candles_m5)} H1={len(candles_h1)}
 Scanning every 30 seconds! ပိုင်မှဝင်! 💪
 ━━━━━━━━━━━━━━━━━"""
         await update.message.reply_text(msg)
@@ -2048,6 +2136,7 @@ async def check_coordinator_message(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     load_data()
+    load_spot_candles()  # Load persisted spot M5 candles
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Core commands
@@ -2086,7 +2175,7 @@ def main():
     application.job_queue.run_repeating(scan_status_update, interval=3600, first=3600)
     application.job_queue.run_repeating(check_coordinator_message, interval=5, first=5)
     
-    logger.info("ပေါ်ဦး Signal Bot v3.2 started - Real OHLC Candles from Yahoo Finance! RSI + SMC accuracy fixed!")
+    logger.info("ပေါ်ဦး Signal Bot v3.3 started - Spot M5 candle builder for MT5-matching RSI!")
     application.run_polling(poll_interval=0.3)
 
 if __name__ == "__main__":
