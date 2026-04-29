@@ -778,25 +778,37 @@ def get_dubai_now():
 def is_market_open():
     """Check if gold market is open.
     XM Broker GOLDm# hours:
-    - Opens: Monday ~02:05 Dubai (Sunday 6pm ET + 5min)
+    - Opens: Monday ~03:05 Dubai (Sunday 6pm ET + 5min)
+    - Daily maintenance break: 00:55 - 03:05 Dubai (Mon-Fri)
     - Closes: Saturday ~00:55 Dubai (Friday 23:55 EEST)
-    Conservative schedule to avoid trading at market edges:
-    - Saturday: open until 00:50 Dubai (5 min before XM close)
-    - Saturday 00:50 - Sunday: CLOSED
-    - Sunday 23:30 Dubai: opens (buffer before Monday session)
+    Conservative schedule:
+    - Daily break: 00:50 - 03:10 Dubai (buffer around XM maintenance)
+    - Saturday 00:50 onwards: CLOSED (weekend)
+    - Sunday 23:30: opens (buffer before Monday session)
     """
     now = get_dubai_now()
     weekday = now.weekday()
     hour = now.hour
     minute = now.minute
+    
+    # Weekend close
     if weekday == 5:  # Saturday
-        # XM closes Friday 23:55 EEST = Saturday 00:55 Dubai
         if hour == 0 and minute < 50:
-            return True
+            return True  # Friday session ending
         return False  # Closed after 00:50 Saturday
     if weekday == 6:  # Sunday
         return hour >= 23 and minute >= 30  # Opens ~11:30PM Dubai
-    return True  # Mon-Fri: market open 24h
+    
+    # Daily maintenance break: 00:55 - 03:05 Dubai (Mon-Fri)
+    # Conservative: 00:50 - 03:10 to avoid trading at edges
+    if hour == 0 and minute >= 50:
+        return False  # Closing for daily maintenance
+    if hour == 1 or hour == 2:
+        return False  # Daily maintenance break
+    if hour == 3 and minute < 10:
+        return False  # Still in maintenance buffer
+    
+    return True  # Market open
 
 async def fetch_gold_price():
     global cached_price, last_fetch_time

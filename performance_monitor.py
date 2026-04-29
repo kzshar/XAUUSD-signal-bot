@@ -102,15 +102,27 @@ def today_str() -> str:
     return now_dubai().date().isoformat()
 
 def is_market_open() -> bool:
-    """Gold market hours (Dubai time):
-    Opens: Monday ~2AM (Sunday 6pm ET)
-    Closes: Saturday ~1-2AM (Friday 5pm ET)
+    """Gold market hours (Dubai time) - matches bot.py logic.
+    XM GOLDm# daily maintenance: 00:55 - 03:05 Dubai
+    Weekend: Saturday 00:50 onwards until Sunday 23:30
     """
     n = now_dubai()
-    wd, h = n.weekday(), n.hour
-    if wd == 5: return h < 2   # Saturday: open until ~2AM Dubai
-    if wd == 6: return h >= 23  # Sunday: opens ~11PM Dubai
-    return True                 # Mon-Fri: open 24h
+    wd, h, m = n.weekday(), n.hour, n.minute
+    # Weekend
+    if wd == 5:  # Saturday
+        if h == 0 and m < 50:
+            return True
+        return False
+    if wd == 6:  # Sunday
+        return h >= 23 and m >= 30
+    # Daily maintenance break: 00:50 - 03:10 Dubai
+    if h == 0 and m >= 50:
+        return False
+    if h == 1 or h == 2:
+        return False
+    if h == 3 and m < 10:
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
