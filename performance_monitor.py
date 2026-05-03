@@ -46,20 +46,21 @@ def now_dubai():
 
 
 def is_market_open() -> bool:
-    """Match bot.py market hours logic."""
+    """Match bot.py market hours logic.
+    XM GOLDm#: Mon-Fri 02:05-00:55 Dubai time.
+    Weekend: Saturday 00:55 - Monday 02:05 CLOSED.
+    Daily break: 00:55-02:05 Dubai.
+    """
     n = now_dubai()
     wd, h, m = n.weekday(), n.hour, n.minute
-    if wd == 5:
-        if h == 0 and m < 50:
-            return True
+    t = h * 60 + m
+    if wd == 5:  # Saturday: only 00:00-00:55
+        return t < 55
+    if wd == 6:  # Sunday: CLOSED
         return False
-    if wd == 6:
-        return h >= 23 and m >= 30
-    if h == 0 and m >= 50:
+    if wd == 0 and t < 125:  # Monday: closed until 02:05
         return False
-    if h in (1, 2):
-        return False
-    if h == 3 and m < 10:
+    if t >= 55 and t < 125:  # Daily break 00:55-02:05
         return False
     return True
 

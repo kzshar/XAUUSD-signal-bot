@@ -99,21 +99,32 @@ def now_dubai() -> datetime.datetime:
 
 def is_market_open() -> bool:
     """XM GOLDm# market hours (Dubai time).
-    Daily maintenance: 00:50 - 03:10
-    Weekend: Saturday 00:50 - Sunday 23:30
+    XM server = EEST (UTC+3), Dubai = UTC+4 = EEST+1
+    XM GOLDm#: Mon-Fri 01:05-23:55 EEST
+    Dubai: Mon-Fri 02:05-00:55(next day)
+    Daily break: 00:55-02:05 Dubai
+    Weekend: Saturday 00:55 Dubai - Monday 02:05 Dubai
     """
     n = now_dubai()
     wd, h, m = n.weekday(), n.hour, n.minute
+    t = h * 60 + m  # minutes since midnight
+    
+    # Saturday: only open 00:00-00:55 (tail of Friday session)
     if wd == 5:  # Saturday
-        return h == 0 and m < 50
-    if wd == 6:  # Sunday
-        return h >= 23 and m >= 30
-    if h == 0 and m >= 50:
+        return t < 55
+    
+    # Sunday: CLOSED all day
+    if wd == 6:
         return False
-    if h in (1, 2):
+    
+    # Monday: closed until 02:05
+    if wd == 0 and t < 125:  # 2*60+5 = 125
         return False
-    if h == 3 and m < 10:
+    
+    # Tue-Fri: daily maintenance break 00:55-02:05
+    if t >= 55 and t < 125:
         return False
+    
     return True
 
 
