@@ -684,42 +684,63 @@ async def generate_signal(context: ContextTypes.DEFAULT_TYPE, price: float):
     if len(candles_m5) < 50 or len(candles_h1) < 20:
         return
 
-    # Step 1: Check EMA crossover for direction
-    ema_dir, ema_fast, ema_slow = get_ema_signal(candles_m5)
-    
-    if ema_dir is None:
-        # No recent EMA cross - also check trend bias as alternative
-        bias = get_ema_trend_bias(candles_m5)
-        if bias == "BULLISH":
-            ema_dir = "BUY"
-        elif bias == "BEARISH":
-            ema_dir = "SELL"
-        else:
-            return  # No clear direction
-
-    # Avoid duplicate signals for same cross
-    if ema_dir == last_ema_cross:
-        return
-    
-    # Step 2: Check HTF trend alignment
+    # Step 1: Determine direction from HTF trend (primary) + M5 EMA (confirmation)
     htf = detect_htf_trend(candles_h1)
-    if ema_dir == "BUY" and htf == "BEARISH":
-        return
-    if ema_dir == "SELL" and htf == "BULLISH":
-        return
-
-    # Step 3: RSI filter - don't buy overbought, don't sell oversold
+    ema_dir, ema_fast, ema_slow = get_ema_signal(candles_m5)
+    bias = get_ema_trend_bias(candles_m5)
+    
+    # Direction logic: HTF trend is primary
     rsi = calculate_rsi(candles_m5, RSI_PERIOD)
+    direction = None
+    if htf == "BULLISH":
+        # HTF bullish - look for BUY entries
+        # Allow if: M5 aligned, OR M5 ranging, OR RSI dipped (pullback buy)
+        if bias == "BULLISH" or ema_dir == "BUY":
+            direction = "BUY"
+        elif bias == "RANGING":
+            direction = "BUY"
+        elif rsi is not None and rsi < 45:
+            direction = "BUY"  # Pullback in bullish trend
+    elif htf == "BEARISH":
+        # HTF bearish - look for SELL entries
+        # Allow if: M5 aligned, OR M5 ranging, OR RSI bounced (rally sell)
+        if bias == "BEARISH" or ema_dir == "SELL":
+            direction = "SELL"
+        elif bias == "RANGING":
+            direction = "SELL"
+        elif rsi is not None and rsi > 55:
+            direction = "SELL"  # Rally in bearish trend (sell the bounce)
+    else:
+        # HTF ranging - use M5 EMA direction
+        if ema_dir is not None:
+            direction = ema_dir
+        elif bias == "BULLISH":
+            direction = "BUY"
+        elif bias == "BEARISH":
+            direction = "SELL"
+    
+    if direction is None:
+        return  # No clear direction
+
+    # Avoid duplicate signals for same direction
+    if direction == last_ema_cross:
+        return
+    
+    # Step 2: RSI filter - don't buy overbought, don't sell oversold
+    if rsi is None:
+        rsi = calculate_rsi(candles_m5, RSI_PERIOD)
     if rsi is not None:
-        if ema_dir == "BUY" and rsi > RSI_OVERBOUGHT:
+        if direction == "BUY" and rsi > RSI_OVERBOUGHT:
             return
-        if ema_dir == "SELL" and rsi < RSI_OVERSOLD:
+        if direction == "SELL" and rsi < RSI_OVERSOLD:
             return
 
-    # Step 4: Run full checklist
-    score, checks = run_checklist(price, ema_dir)
+    # Step 3: Run full checklist
+    score, checks = run_checklist(price, direction)
     if score < MIN_CHECKLIST_SCORE:
         return
+    
+    ema_dir = direction
 
     # Signal confirmed!
     last_ema_cross = ema_dir
