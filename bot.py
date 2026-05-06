@@ -29,7 +29,7 @@ from telegram.ext import (
 # ═══════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8653316966:AAGdqc_ip9cZwual3AONsMzKKknhJW3jrKg")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8785447693:AAHieuYnespi21eYPIxQn-rEPQ0D6qCZIJ0")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "5948621771"))
 DUBAI_TZ = pytz.timezone("Asia/Dubai")
 VERSION = "4.1"
