@@ -267,64 +267,94 @@ class BotState:
 bot_state = BotState()
 
 # --- Technical Analysis & Price Data --- #
-async def get_yahoo_finance_data(symbol='GC=F', interval='5m', range_param='1d'):
-    # Yahoo Finance API is not officially supported for direct programmatic access without rate limits/keys.
-    # For this exercise, we'll simulate or use a simple request that might be unstable.
-    # In a real-world scenario, a reliable data provider API (e.g., Alpha Vantage, Finnhub) would be used.
-    # For M5 candles, '1d' range is often too short for 200 periods. '5d' or '7d' might be better.
-    # For H1 candles, '60m' interval and '5d' range.
+# Cache for candle data to avoid excessive API calls
+_candles_m5 = []
+_candles_h1 = []
+_last_candle_fetch = 0
+_cached_price = None
 
-    # Simulating data for demonstration purposes
-    # In a real scenario, you'd make an HTTP request and parse JSON/CSV.
-    # Example: https://query1.finance.yahoo.com/v7/finance/download/GC=F?period1=...&period2=...&interval=5m&events=history
+async def get_yahoo_finance_data(symbol='GC=F', interval='5m', range_param='5d'):
+    """Fetch real candle data from Yahoo Finance GC=F (Gold Futures)."""
+    global _candles_m5, _candles_h1, _last_candle_fetch
+    import time as _time
+    
+    now = _time.time()
+    # Cache for 60 seconds to avoid rate limiting
+    if now - _last_candle_fetch < 60 and ((interval == '5m' and _candles_m5) or (interval in ('60m', '1h') and _candles_h1)):
+        if interval == '5m':
+            return _candles_m5
+        else:
+            return _candles_h1
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    # Determine URL parameters
+    if interval == '5m':
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=5m&range=5d"
+    elif interval in ('60m', '1h'):
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1h&range=1mo"
+    else:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range_param}"
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()["chart"]["result"][0]
+            ts = data["timestamp"]
+            q = data["indicators"]["quote"][0]
+            candles = []
+            for i in range(len(ts)):
+                o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+                if any(v is None for v in (o, h, l, c)):
+                    continue
+                if o == h == l == c:
+                    continue
+                candles.append({
+                    'timestamp': ts[i],
+                    'open': float(o),
+                    'high': float(h),
+                    'low': float(l),
+                    'close': float(c),
+                    'volume': int(q.get('volume', [0]*len(ts))[i] or 0)
+                })
+            
+            if candles:
+                if interval == '5m':
+                    _candles_m5 = candles
+                    logger.info(f"M5: {len(_candles_m5)} candles fetched")
+                else:
+                    _candles_h1 = candles
+                    logger.info(f"H1: {len(_candles_h1)} candles fetched")
+                _last_candle_fetch = now
+                return candles
+            else:
+                logger.warning(f"No valid candles parsed for {interval}")
+        else:
+            logger.error(f"Yahoo Finance returned status {r.status_code} for {interval}")
+    except Exception as e:
+        logger.error(f"Error fetching {interval} data: {e}")
+    
+    # Return cached data if fetch fails
+    if interval == '5m':
+        return _candles_m5
+    return _candles_h1
 
-    logger.info(f"Fetching {symbol} data for interval {interval} and range {range_param}...")
-    
-    # Placeholder for actual data fetching logic
-    # This part needs a robust data source. For now, returning dummy data.
-    # A real implementation would parse JSON/CSV from a financial API.
-    
-    # Dummy data structure: list of dicts, each dict is a candle
-    # Keys: 'timestamp', 'open', 'high', 'low', 'close', 'volume'
-    
-    # Generate dummy data for the last 200 M5 candles (approx 16 hours)
-    now_utc = datetime.now(UTC_TZ)
-    data = []
-    for i in range(200, 0, -1):
-        ts = now_utc - timedelta(minutes=5 * i)
-        close_price = 2300 + np.sin(i * 0.1) * 10 + np.random.rand() * 2
-        open_price = close_price + (np.random.rand() - 0.5) * 1
-        high_price = max(open_price, close_price) + np.random.rand() * 0.5
-        low_price = min(open_price, close_price) - np.random.rand() * 0.5
-        data.append({
-            'timestamp': ts.isoformat(),
-            'open': open_price,
-            'high': high_price,
-            'low': low_price,
-            'close': close_price,
-            'volume': 1000 + np.random.randint(-200, 200)
-        })
-    
-    # For H1 data, we'd fetch separately or aggregate M5 data
-    if interval == '60m':
-        h1_data = []
-        for i in range(50, 0, -1):
-            ts = now_utc - timedelta(hours=i)
-            close_price = 2300 + np.sin(i * 0.5) * 20 + np.random.rand() * 5
-            open_price = close_price + (np.random.rand() - 0.5) * 2
-            high_price = max(open_price, close_price) + np.random.rand() * 1
-            low_price = min(open_price, close_price) - np.random.rand() * 1
-            h1_data.append({
-                'timestamp': ts.isoformat(),
-                'open': open_price,
-                'high': high_price,
-                'low': low_price,
-                'close': close_price,
-                'volume': 5000 + np.random.randint(-1000, 1000)
-            })
-        return h1_data
-
-    return data
+async def get_current_price():
+    """Get current spot price from Yahoo Finance."""
+    global _cached_price
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d",
+            headers=headers, timeout=8
+        )
+        if r.status_code == 200:
+            price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+            _cached_price = price
+            return price
+    except Exception as e:
+        logger.warning(f"Price fetch failed: {e}")
+    return _cached_price
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -667,8 +697,8 @@ async def auto_scan_for_signals(context: ContextTypes.DEFAULT_TYPE, manual_scan=
         return
 
     # Fetch price data
-    m5_candles = await get_yahoo_finance_data(interval='5m', range_param='7d') # Need enough for 50 EMA
-    h1_candles = await get_yahoo_finance_data(interval='60m', range_param='5d') # For HTF trend (not fully implemented in ALPHA yet)
+    m5_candles = await get_yahoo_finance_data(interval='5m', range_param='5d')  # Need enough for 50 EMA
+    h1_candles = await get_yahoo_finance_data(interval='60m', range_param='1mo')  # For HTF trend
 
     if not m5_candles or not h1_candles:
         logger.error("Could not fetch sufficient price data.")
@@ -780,13 +810,10 @@ async def monitor_trade_outcome(context: ContextTypes.DEFAULT_TYPE, trade_id: st
             return
 
         # Fetch latest price to check TP/SL
-        m5_candles = await get_yahoo_finance_data(interval='5m', range_param='1d')
-        if not m5_candles:
+        current_price = await get_current_price()
+        if current_price is None:
             logger.error("Could not fetch price data for trade monitoring.")
             continue
-        
-        latest_candle = m5_candles[-1]
-        current_price = latest_candle['close']
         trade['bars_held'] += 1 # Increment bars held
 
         result = None
@@ -837,6 +864,7 @@ async def weekly_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- Main Bot Setup --- #
 def main() -> None:
+    global application
     # Create data directory if it doesn't exist
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(WEEKLY_REPORTS_DIR, exist_ok=True)
@@ -862,6 +890,8 @@ def main() -> None:
     logger.info("Bot started polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+# Global application instance
+application = None
+
 if __name__ == '__main__':
-    application = None # Global application instance
     main()
