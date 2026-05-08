@@ -1,1101 +1,867 @@
-#!/usr/bin/env python3
-"""
-PawOo Gold Signal Bot v4.1
-==========================
-XAU/USD Scalping Signal Bot - EMA + SMC/ICT Hybrid Strategy
-Clean rebuild - Production ready for Railway.app
 
-Strategy: EMA(9/21) crossover + SMC/ICT confirmation + RSI filter
-Data: Yahoo Finance GC=F candles + gold-api.com spot price
-Broker: XM Micro (GOLDm#) 0.5 lot
-"""
-
-import asyncio
-import datetime
-import json
-import logging
 import os
-import time
-from typing import Dict, List, Optional, Tuple
-
+import json
+import asyncio
+import logging
+from datetime import datetime, timedelta
 import pytz
+import numpy as np
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ═══════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8785447693:AAHieuYnespi21eYPIxQn-rEPQ0D6qCZIJ0")
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "5948621771"))
-DUBAI_TZ = pytz.timezone("Asia/Dubai")
-VERSION = "4.1"
+# --- Configuration --- #
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8785447693:AAHieuYnespi21eYPIxQn-rEPQ0D6qCZIJ0')
+ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '5948621771'))
+DATA_DIR = os.environ.get('DATA_DIR', './data')
+
+TRADE_JOURNAL_PATH = os.path.join(DATA_DIR, 'trade_journal.json')
+LEARNING_STATE_PATH = os.path.join(DATA_DIR, 'learning_state.json')
+WEEKLY_REPORTS_DIR = os.path.join(DATA_DIR, 'weekly_reports')
 
 # Trading Parameters
-LOT_SIZE = 0.5
-PIP_VALUE = 0.005  # XM Micro 1 point = $0.005
-SL_DOLLARS = 4.0
-TP1_DOLLARS = 10.0
-TP2_DOLLARS = 15.0
-MAX_DAILY_TRADES = 5
-DAILY_LOSS_LIMIT = -10.0
-COOLDOWN_SECONDS = 600  # 10 minutes between signals
-SCAN_INTERVAL = 30
+SL_AMOUNT = 5.0  # $5
+TP_AMOUNT = 8.0  # $8
+MAX_TRADES_PER_DAY = 5
+COOLDOWN_MINUTES = 10
+TRADE_TIMEOUT_HOURS = 4 # 48 M5 candles
 
-# Strategy Parameters
-EMA_FAST = 9
-EMA_SLOW = 21
-EMA_TREND = 50   # H1 trend EMA
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
-MIN_CHECKLIST_SCORE = 5  # Minimum 5/9 for signal (was 6, now easier)
+# Timezones
+DUBAI_TZ = pytz.timezone('Asia/Dubai')
+UTC_TZ = pytz.utc
 
-# File paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRADE_HISTORY_FILE = os.path.join(BASE_DIR, "trade_history.json")
-SIGNAL_LOG_FILE = os.path.join(BASE_DIR, "signal_log.json")
-BOT_STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+# Market Hours (Dubai Time)
+MARKET_OPEN_MONDAY = DUBAI_TZ.localize(datetime(2000, 1, 1, 2, 5, 0))
+MARKET_CLOSE_SATURDAY = DUBAI_TZ.localize(datetime(2000, 1, 1, 0, 55, 0))
+DAILY_BREAK_START = DUBAI_TZ.localize(datetime(2000, 1, 1, 0, 55, 0))
+DAILY_BREAK_END = DUBAI_TZ.localize(datetime(2000, 1, 1, 2, 5, 0))
 
-# ═══════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, "bot.log"), encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("PawOoBot")
+# Sessions (Dubai Time)
+SESSION_ASIAN_START = DUBAI_TZ.localize(datetime(2000, 1, 1, 2, 5, 0))
+SESSION_ASIAN_END = DUBAI_TZ.localize(datetime(2000, 1, 1, 10, 0, 0))
+SESSION_LONDON_START = DUBAI_TZ.localize(datetime(2000, 1, 1, 11, 0, 0))
+SESSION_LONDON_END = DUBAI_TZ.localize(datetime(2000, 1, 1, 16, 0, 0))
+SESSION_NY_START = DUBAI_TZ.localize(datetime(2000, 1, 1, 16, 0, 0))
+SESSION_NY_END = DUBAI_TZ.localize(datetime(2000, 1, 1, 0, 55, 0)) # Next day for calculation
 
-# ═══════════════════════════════════════════════════════════════
-# GLOBAL STATE
-# ═══════════════════════════════════════════════════════════════
-candles_m5: List[Dict] = []
-candles_h1: List[Dict] = []
-cached_price: Optional[float] = None
-last_price_fetch: float = 0
-last_candle_fetch: float = 0
-active_trade: Optional[Dict] = None
-active_signal_msg_id: Optional[int] = None
-trade_history: List[Dict] = []
-signal_log: List[Dict] = []
-cooldown_until: float = 0
-signal_count_today: int = 0
-last_reset_date: str = ""
-last_ema_cross: Optional[str] = None  # Track last EMA cross direction
+# Confidence Scoring Initial Values
+INITIAL_CONFIDENCE = 50
+CONFIDENCE_ADJUST_WIN = 5
+CONFIDENCE_ADJUST_LOSS = -7
+MIN_CONFIDENCE_THRESHOLD = 40
+MAX_CONFIDENCE_THRESHOLD = 80
 
-# ═══════════════════════════════════════════════════════════════
-# TIME & MARKET FUNCTIONS
-# ═══════════════════════════════════════════════════════════════
-def now_dubai() -> datetime.datetime:
-    return datetime.datetime.now(DUBAI_TZ)
+# Logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# --- Data Storage & Management --- #
+def load_json(filepath, default_data):
+    if not os.path.exists(filepath):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(default_data, f, indent=4)
+        return default_data
+    with open(filepath, 'r') as f:
+        return json.load(f)
 
-def is_market_open() -> bool:
-    """XM GOLDm# market hours (Dubai time).
-    XM server = EEST (UTC+3), Dubai = UTC+4 = EEST+1
-    XM GOLDm#: Mon-Fri 01:05-23:55 EEST
-    Dubai: Mon-Fri 02:05-00:55(next day)
-    Daily break: 00:55-02:05 Dubai
-    Weekend: Saturday 00:55 Dubai - Monday 02:05 Dubai
-    """
-    n = now_dubai()
-    wd, h, m = n.weekday(), n.hour, n.minute
-    t = h * 60 + m  # minutes since midnight
+def save_json(filepath, data):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=4)
+
+class BotState:
+    def __init__(self):
+        self.trade_journal = load_json(TRADE_JOURNAL_PATH, [])
+        self.learning_state = load_json(LEARNING_STATE_PATH, self._get_initial_learning_state())
+        self.active_trades = {}
+        self.last_signal_time = None
+        self.today_trades_count = 0
+        self.today_wins = 0
+        self._reset_daily_stats()
+
+    def _get_initial_learning_state(self):
+        return {
+            'confidence_scores': {
+                'EMA_aligned': INITIAL_CONFIDENCE,
+                'price_near_EMA21': INITIAL_CONFIDENCE,
+                'candle_pattern': INITIAL_CONFIDENCE,
+                'RSI_neutral': INITIAL_CONFIDENCE,
+                'momentum': INITIAL_CONFIDENCE,
+                'extra_filter_1': INITIAL_CONFIDENCE, # Placeholder for future filters
+            },
+            'current_confidence_threshold': 60, # Initial threshold
+            'adaptive_threshold_settings': {
+                'base_threshold': 60,
+                'tight_filter_active': False,
+                'extra_filter_active': False,
+            },
+            'session_performance': {
+                'Asian': {'trades': 0, 'wins': 0, 'confidence_modifier': 0},
+                'London': {'trades': 0, 'wins': 0, 'confidence_modifier': 0},
+                'NY': {'trades': 0, 'wins': 0, 'confidence_modifier': 0},
+            },
+            'last_weekly_review': datetime.now(DUBAI_TZ).isoformat()
+        }
+
+    def _reset_daily_stats(self):
+        now = datetime.now(DUBAI_TZ)
+        if not hasattr(self, '_last_daily_reset') or self._last_daily_reset.date() != now.date():
+            self.today_trades_count = 0
+            self.today_wins = 0
+            self._last_daily_reset = now
+
+    def record_trade(self, trade_entry):
+        self.trade_journal.append(trade_entry)
+        save_json(TRADE_JOURNAL_PATH, self.trade_journal)
+        self.today_trades_count += 1
+        if trade_entry['result'] == 'WIN':
+            self.today_wins += 1
+        self.update_learning_state(trade_entry)
+
+    def update_learning_state(self, trade_entry):
+        # Update confidence scores
+        for condition, present in trade_entry['entry_conditions_met'].items():
+            if present and condition in self.learning_state['confidence_scores']:
+                if trade_entry['result'] == 'WIN':
+                    self.learning_state['confidence_scores'][condition] += CONFIDENCE_ADJUST_WIN
+                elif trade_entry['result'] == 'LOSS':
+                    self.learning_state['confidence_scores'][condition] += CONFIDENCE_ADJUST_LOSS
+                # Ensure scores stay within a reasonable range (e.g., 0-100)
+                self.learning_state['confidence_scores'][condition] = max(0, min(100, self.learning_state['confidence_scores'][condition]))
+
+        # Update session performance
+        session = trade_entry['session']
+        if session in self.learning_state['session_performance']:
+            self.learning_state['session_performance'][session]['trades'] += 1
+            if trade_entry['result'] == 'WIN':
+                self.learning_state['session_performance'][session]['wins'] += 1
+
+        # Adjust adaptive thresholds
+        self._adjust_adaptive_thresholds()
+
+        save_json(LEARNING_STATE_PATH, self.learning_state)
+
+    def _adjust_adaptive_thresholds(self):
+        recent_trades = self.trade_journal[-20:]
+        last_10_trades = recent_trades[-10:]
+        last_20_trades = recent_trades
+
+        wr_10 = (sum(1 for t in last_10_trades if t['result'] == 'WIN') / len(last_10_trades)) * 100 if last_10_trades else 0
+        wr_20 = (sum(1 for t in last_20_trades if t['result'] == 'WIN') / len(last_20_trades)) * 100 if last_20_trades else 0
+
+        current_threshold = self.learning_state['adaptive_threshold_settings']['base_threshold']
+        tight_filter_active = self.learning_state['adaptive_threshold_settings']['tight_filter_active']
+        extra_filter_active = self.learning_state['adaptive_threshold_settings']['extra_filter_active']
+
+        # Tighten entry if WR < 40% (last 10 trades)
+        if wr_10 < 40 and not tight_filter_active:
+            current_threshold += 10 # Make it harder to trigger
+            self.learning_state['adaptive_threshold_settings']['tight_filter_active'] = True
+            logger.info("Adaptive system: Tightening entry due to 10-trade WR < 40%.")
+        elif wr_10 >= 55 and tight_filter_active:
+            current_threshold -= 5 # Relax slightly
+            self.learning_state['adaptive_threshold_settings']['tight_filter_active'] = False
+            logger.info("Adaptive system: Relaxing entry due to 10-trade WR > 55%.")
+
+        # Pause trading if WR < 35% (last 20 trades)
+        if wr_20 < 35 and not extra_filter_active:
+            self.learning_state['adaptive_threshold_settings']['extra_filter_active'] = True
+            self.learning_state['current_confidence_threshold'] = 1000 # Effectively pause trading
+            logger.warning("Adaptive system: Pausing trading for 1 hour due to 20-trade WR < 35%.")
+            asyncio.create_task(self._resume_trading_after_pause())
+        elif wr_20 >= 35 and extra_filter_active:
+            self.learning_state['adaptive_threshold_settings']['extra_filter_active'] = False
+            current_threshold = self.learning_state['adaptive_threshold_settings']['base_threshold'] # Reset to base
+            logger.info("Adaptive system: Resuming trading as 20-trade WR improved.")
+
+        self.learning_state['current_confidence_threshold'] = max(MIN_CONFIDENCE_THRESHOLD, min(MAX_CONFIDENCE_THRESHOLD, current_threshold))
+
+    async def _resume_trading_after_pause(self):
+        await asyncio.sleep(3600) # Wait for 1 hour
+        self.learning_state['adaptive_threshold_settings']['extra_filter_active'] = False
+        self.learning_state['current_confidence_threshold'] = self.learning_state['adaptive_threshold_settings']['base_threshold']
+        save_json(LEARNING_STATE_PATH, self.learning_state)
+        logger.info("Adaptive system: Trading resumed after 1-hour pause.")
+        await application.bot.send_message(chat_id=ADMIN_CHAT_ID, text="Trading resumed after 1-hour pause due to low 20-trade WR. Settings reset to base.")
+
+    def get_session_confidence_modifier(self, session_name):
+        session_data = self.learning_state['session_performance'].get(session_name)
+        if not session_data or session_data['trades'] < 5: # Need enough data
+            return 0
+        wr = (session_data['wins'] / session_data['trades']) * 100
+        if wr > 60: return 5
+        if wr < 40: return -5
+        return 0
+
+    def weekly_self_review(self):
+        now = datetime.now(DUBAI_TZ)
+        last_review_str = self.learning_state['last_weekly_review']
+        last_review = datetime.fromisoformat(last_review_str).astimezone(DUBAI_TZ)
+
+        if now.weekday() == 6 and (now - last_review).days >= 6: # Sunday and at least a week passed
+            logger.info("Performing weekly self-review...")
+            report_filename = os.path.join(WEEKLY_REPORTS_DIR, f"weekly_report_{now.strftime('%Y%m%d')}.json")
+            weekly_trades = [t for t in self.trade_journal if datetime.fromisoformat(t['timestamp']).astimezone(DUBAI_TZ) > last_review]
+
+            # Calculate per-session stats
+            session_stats = {'Asian': {'trades': 0, 'wins': 0, 'wr': 0}, 'London': {'trades': 0, 'wins': 0, 'wr': 0}, 'NY': {'trades': 0, 'wins': 0, 'wr': 0}}
+            for trade in weekly_trades:
+                session = trade['session']
+                if session in session_stats:
+                    session_stats[session]['trades'] += 1
+                    if trade['result'] == 'WIN':
+                        session_stats[session]['wins'] += 1
+            for session, data in session_stats.items():
+                if data['trades'] > 0:
+                    session_stats[session]['wr'] = (data['wins'] / data['trades']) * 100
+
+            # Identify worst-performing conditions (simple approach: lowest average confidence for losses)
+            condition_performance = {cond: {'wins': 0, 'losses': 0} for cond in self.learning_state['confidence_scores']}
+            for trade in weekly_trades:
+                for cond, present in trade['entry_conditions_met'].items():
+                    if present and cond in condition_performance:
+                        if trade['result'] == 'WIN':
+                            condition_performance[cond]['wins'] += 1
+                        elif trade['result'] == 'LOSS':
+                            condition_performance[cond]['losses'] += 1
+            
+            worst_conditions = sorted(condition_performance.items(), key=lambda item: item[1]['losses'] - item[1]['wins'], reverse=True)
+
+            # Auto-adjust parameters (example: reset base threshold if overall WR is good)
+            overall_wr = (sum(1 for t in weekly_trades if t['result'] == 'WIN') / len(weekly_trades)) * 100 if weekly_trades else 0
+            if overall_wr > 50:
+                self.learning_state['adaptive_threshold_settings']['base_threshold'] = 60 # Reset to default good
+            else:
+                self.learning_state['adaptive_threshold_settings']['base_threshold'] = 70 # Tighten for next week
+
+            report_data = {
+                'review_date': now.isoformat(),
+                'period_start': last_review_str,
+                'period_end': now.isoformat(),
+                'total_trades': len(weekly_trades),
+                'overall_win_rate': overall_wr,
+                'session_stats': session_stats,
+                'condition_performance': condition_performance,
+                'worst_performing_conditions': [wc[0] for wc in worst_conditions[:3]],
+                'new_base_threshold': self.learning_state['adaptive_threshold_settings']['base_threshold']
+            }
+            save_json(report_filename, report_data)
+            self.learning_state['last_weekly_review'] = now.isoformat()
+            save_json(LEARNING_STATE_PATH, self.learning_state)
+
+            report_text = f"Weekly Self-Review Report ({last_review.strftime('%Y-%m-%d')} to {now.strftime('%Y-%m-%d')})\n\n"
+            report_text += f"Overall Win Rate: {overall_wr:.2f}% ({len(weekly_trades)} trades)\n\n"
+            report_text += "Session Performance:\n"
+            for session, data in session_stats.items():
+                report_text += f"  {session}: {data['trades']} trades, {data['wins']} wins, {data['wr']:.2f}% WR\n"
+            report_text += "\nTop 3 Worst Performing Conditions (based on win/loss difference):\n"
+            for wc in worst_conditions[:3]:
+                report_text += f"  - {wc[0]} (Wins: {wc[1]['wins']}, Losses: {wc[1]['losses']})\n"
+            report_text += f"\nNew Base Confidence Threshold for next week: {self.learning_state['adaptive_threshold_settings']['base_threshold']}%\n"
+
+            asyncio.create_task(application.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report_text))
+            logger.info("Weekly self-review completed and report sent.")
+
+# Global bot state instance
+bot_state = BotState()
+
+# --- Technical Analysis & Price Data --- #
+async def get_yahoo_finance_data(symbol='GC=F', interval='5m', range_param='1d'):
+    # Yahoo Finance API is not officially supported for direct programmatic access without rate limits/keys.
+    # For this exercise, we'll simulate or use a simple request that might be unstable.
+    # In a real-world scenario, a reliable data provider API (e.g., Alpha Vantage, Finnhub) would be used.
+    # For M5 candles, '1d' range is often too short for 200 periods. '5d' or '7d' might be better.
+    # For H1 candles, '60m' interval and '5d' range.
+
+    # Simulating data for demonstration purposes
+    # In a real scenario, you'd make an HTTP request and parse JSON/CSV.
+    # Example: https://query1.finance.yahoo.com/v7/finance/download/GC=F?period1=...&period2=...&interval=5m&events=history
+
+    logger.info(f"Fetching {symbol} data for interval {interval} and range {range_param}...")
     
-    # Saturday: only open 00:00-00:55 (tail of Friday session)
-    if wd == 5:  # Saturday
-        return t < 55
+    # Placeholder for actual data fetching logic
+    # This part needs a robust data source. For now, returning dummy data.
+    # A real implementation would parse JSON/CSV from a financial API.
     
-    # Sunday: CLOSED all day
-    if wd == 6:
-        return False
+    # Dummy data structure: list of dicts, each dict is a candle
+    # Keys: 'timestamp', 'open', 'high', 'low', 'close', 'volume'
     
-    # Monday: closed until 02:05
-    if wd == 0 and t < 125:  # 2*60+5 = 125
-        return False
+    # Generate dummy data for the last 200 M5 candles (approx 16 hours)
+    now_utc = datetime.now(UTC_TZ)
+    data = []
+    for i in range(200, 0, -1):
+        ts = now_utc - timedelta(minutes=5 * i)
+        close_price = 2300 + np.sin(i * 0.1) * 10 + np.random.rand() * 2
+        open_price = close_price + (np.random.rand() - 0.5) * 1
+        high_price = max(open_price, close_price) + np.random.rand() * 0.5
+        low_price = min(open_price, close_price) - np.random.rand() * 0.5
+        data.append({
+            'timestamp': ts.isoformat(),
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': 1000 + np.random.randint(-200, 200)
+        })
     
-    # Tue-Fri: daily maintenance break 00:55-02:05
-    if t >= 55 and t < 125:
-        return False
-    
-    return True
+    # For H1 data, we'd fetch separately or aggregate M5 data
+    if interval == '60m':
+        h1_data = []
+        for i in range(50, 0, -1):
+            ts = now_utc - timedelta(hours=i)
+            close_price = 2300 + np.sin(i * 0.5) * 20 + np.random.rand() * 5
+            open_price = close_price + (np.random.rand() - 0.5) * 2
+            high_price = max(open_price, close_price) + np.random.rand() * 1
+            low_price = min(open_price, close_price) - np.random.rand() * 1
+            h1_data.append({
+                'timestamp': ts.isoformat(),
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': 5000 + np.random.randint(-1000, 1000)
+            })
+        return h1_data
 
+    return data
 
-def get_session() -> str:
-    n = now_dubai()
-    h, m = n.hour, n.minute
-    t = h * 60 + m
-    if t >= 990 or t < 50:
-        return "New York"
-    if 660 <= t < 990:
-        return "London"
-    if 990 <= t < 1200:
-        return "London/NY"
-    return "Asian"
-
-
-def is_active_session() -> bool:
-    return get_session() in ("London", "New York", "London/NY")
-
-
-# ═══════════════════════════════════════════════════════════════
-# DATA FETCHING
-# ═══════════════════════════════════════════════════════════════
-def fetch_spot_price() -> Optional[float]:
-    global cached_price, last_price_fetch
-    now = time.time()
-    if now - last_price_fetch < 20 and cached_price:
-        return cached_price
-    try:
-        r = requests.get("https://api.gold-api.com/price/XAU", timeout=8)
-        if r.status_code == 200:
-            price = float(r.json()["price"])
-            cached_price = price
-            last_price_fetch = now
-            return price
-    except Exception as e:
-        logger.warning(f"gold-api failed: {e}")
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d",
-            headers=headers, timeout=8
-        )
-        if r.status_code == 200:
-            price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
-            cached_price = price
-            last_price_fetch = now
-            return price
-    except Exception as e:
-        logger.warning(f"Yahoo fallback failed: {e}")
-    return cached_price
-
-
-def fetch_candles() -> bool:
-    global candles_m5, candles_h1, last_candle_fetch
-    now = time.time()
-    if now - last_candle_fetch < 60:
-        return True
-    headers = {"User-Agent": "Mozilla/5.0"}
-    success = False
-
-    # M5 candles (5d)
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=5d",
-            headers=headers, timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()["chart"]["result"][0]
-            ts = data["timestamp"]
-            q = data["indicators"]["quote"][0]
-            new = []
-            for i in range(len(ts)):
-                o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-                if any(v is None for v in (o, h, l, c)):
-                    continue
-                if o == h == l == c:
-                    continue
-                new.append({"time": ts[i], "open": float(o), "high": float(h),
-                            "low": float(l), "close": float(c)})
-            if new:
-                candles_m5 = new
-                success = True
-                logger.info(f"M5: {len(candles_m5)} candles")
-    except Exception as e:
-        logger.error(f"M5 fetch error: {e}")
-
-    # H1 candles (1mo)
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1h&range=1mo",
-            headers=headers, timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()["chart"]["result"][0]
-            ts = data["timestamp"]
-            q = data["indicators"]["quote"][0]
-            new = []
-            for i in range(len(ts)):
-                o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-                if any(v is None for v in (o, h, l, c)):
-                    continue
-                if o == h == l == c:
-                    continue
-                new.append({"time": ts[i], "open": float(o), "high": float(h),
-                            "low": float(l), "close": float(c)})
-            if new:
-                candles_h1 = new
-                logger.info(f"H1: {len(candles_h1)} candles")
-    except Exception as e:
-        logger.error(f"H1 fetch error: {e}")
-
-    if success:
-        last_candle_fetch = now
-    return success
-
-
-# ═══════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS
-# ═══════════════════════════════════════════════════════════════
-def calculate_ema(candles: List[Dict], period: int) -> List[float]:
-    """Calculate EMA for given period. Returns list of EMA values."""
-    if len(candles) < period:
-        return []
-    closes = [c["close"] for c in candles]
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return [np.nan] * len(prices)
+    ema = [np.nan] * len(prices)
+    sma = np.mean(prices[:period])
+    ema[period - 1] = sma
     multiplier = 2 / (period + 1)
-    ema = [sum(closes[:period]) / period]  # First EMA = SMA
-    for i in range(period, len(closes)):
-        ema.append(closes[i] * multiplier + ema[-1] * (1 - multiplier))
+    for i in range(period, len(prices)):
+        ema[i] = (prices[i] - ema[i-1]) * multiplier + ema[i-1]
     return ema
 
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return [np.nan] * len(prices)
 
-def calculate_rsi(candles: List[Dict], period: int = 14) -> Optional[float]:
-    """RSI using Wilder's smoothed method (matches MT5/TradingView)."""
-    if len(candles) < period + 1:
-        return None
-    closes = [c["close"] for c in candles]
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas[:period]]
-    losses = [-d if d < 0 else 0 for d in deltas[:period]]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    for i in range(period, len(deltas)):
-        d = deltas[i]
-        avg_gain = (avg_gain * (period - 1) + (d if d > 0 else 0)) / period
-        avg_loss = (avg_loss * (period - 1) + (-d if d < 0 else 0)) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
 
+    avg_gain = np.array([np.nan] * len(prices))
+    avg_loss = np.array([np.nan] * len(prices))
 
-def get_ema_signal(candles: List[Dict]) -> Tuple[Optional[str], float, float]:
-    """Check EMA(9/21) crossover signal.
-    
-    Returns: (direction or None, ema_fast, ema_slow)
-    - BUY: EMA9 crosses above EMA21 (golden cross)
-    - SELL: EMA9 crosses below EMA21 (death cross)
-    """
-    if len(candles) < EMA_SLOW + 2:
-        return None, 0, 0
-    
-    ema_fast = calculate_ema(candles, EMA_FAST)
-    ema_slow = calculate_ema(candles, EMA_SLOW)
-    
-    if len(ema_fast) < 2 or len(ema_slow) < 2:
-        return None, 0, 0
-    
-    # Align lengths (EMA_SLOW starts later)
-    offset = EMA_SLOW - EMA_FAST
-    if offset > 0 and len(ema_fast) > offset:
-        ema_fast = ema_fast[offset:]
-    
-    if len(ema_fast) < 2 or len(ema_slow) < 2:
-        return None, 0, 0
-    
-    curr_fast = ema_fast[-1]
-    curr_slow = ema_slow[-1]
-    prev_fast = ema_fast[-2]
-    prev_slow = ema_slow[-2]
-    
-    direction = None
-    # Golden cross: fast crosses above slow
-    if prev_fast <= prev_slow and curr_fast > curr_slow:
-        direction = "BUY"
-    # Death cross: fast crosses below slow
-    elif prev_fast >= prev_slow and curr_fast < curr_slow:
-        direction = "SELL"
-    # Already crossed - check if still valid (within last 3 candles)
-    elif curr_fast > curr_slow:
-        # Check if cross happened recently (within last 5 candles)
-        for i in range(max(0, len(ema_fast)-5), len(ema_fast)-1):
-            j = i
-            if j < len(ema_slow) and j > 0:
-                if ema_fast[j-1] <= ema_slow[j-1] and ema_fast[j] > ema_slow[j]:
-                    direction = "BUY"
-                    break
-    elif curr_fast < curr_slow:
-        for i in range(max(0, len(ema_fast)-5), len(ema_fast)-1):
-            j = i
-            if j < len(ema_slow) and j > 0:
-                if ema_fast[j-1] >= ema_slow[j-1] and ema_fast[j] < ema_slow[j]:
-                    direction = "SELL"
-                    break
-    
-    return direction, round(curr_fast, 2), round(curr_slow, 2)
+    # Wilder's smoothing for initial average
+    avg_gain[period] = np.mean(gains[:period])
+    avg_loss[period] = np.mean(losses[:period])
 
+    for i in range(period + 1, len(prices)):
+        avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i-1]) / period
+        avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i-1]) / period
 
-def get_ema_trend_bias(candles: List[Dict]) -> str:
-    """Get trend bias from EMA positions.
-    
-    - Price above both EMAs + EMA9 > EMA21 = BULLISH
-    - Price below both EMAs + EMA9 < EMA21 = BEARISH
-    - Mixed = RANGING
-    """
-    if len(candles) < EMA_SLOW + 1:
-        return "UNKNOWN"
-    
-    ema_fast = calculate_ema(candles, EMA_FAST)
-    ema_slow = calculate_ema(candles, EMA_SLOW)
-    
-    if not ema_fast or not ema_slow:
-        return "UNKNOWN"
-    
-    price = candles[-1]["close"]
-    ef = ema_fast[-1]
-    es = ema_slow[-1]
-    
-    if price > ef > es:
-        return "BULLISH"
-    elif price < ef < es:
-        return "BEARISH"
-    return "RANGING"
+    rs = np.divide(avg_gain, avg_loss, out=np.full_like(avg_gain, np.nan), where=avg_loss!=0)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.tolist()
 
+def is_bullish_candle(open_price, close_price, high_price, low_price):
+    return close_price > open_price and (close_price - open_price) > (high_price - low_price) * 0.3 # Body is at least 30% of range
 
-def detect_htf_trend(candles: List[Dict]) -> str:
-    """H1 trend using EMA50 + swing structure."""
-    if len(candles) < EMA_TREND + 1:
-        return "UNKNOWN"
-    
-    ema50 = calculate_ema(candles, EMA_TREND)
-    if not ema50:
-        return "UNKNOWN"
-    
-    price = candles[-1]["close"]
-    ema_val = ema50[-1]
-    
-    # Also check recent swing structure
-    recent = candles[-20:]
-    swing_highs = []
-    swing_lows = []
-    for i in range(2, len(recent) - 2):
-        if recent[i]["high"] > recent[i-1]["high"] and recent[i]["high"] > recent[i+1]["high"]:
-            swing_highs.append(recent[i]["high"])
-        if recent[i]["low"] < recent[i-1]["low"] and recent[i]["low"] < recent[i+1]["low"]:
-            swing_lows.append(recent[i]["low"])
-    
-    above_ema = price > ema_val
-    
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        hh = swing_highs[-1] > swing_highs[-2]
-        hl = swing_lows[-1] > swing_lows[-2]
-        ll = swing_lows[-1] < swing_lows[-2]
-        lh = swing_highs[-1] < swing_highs[-2]
-        
-        if above_ema and (hh or hl):
-            return "BULLISH"
-        elif not above_ema and (ll or lh):
-            return "BEARISH"
-    
-    if above_ema:
-        return "BULLISH"
-    else:
-        return "BEARISH"
+def is_bearish_candle(open_price, close_price, high_price, low_price):
+    return close_price < open_price and (open_price - close_price) > (high_price - low_price) * 0.3 # Body is at least 30% of range
 
+def get_current_session(dt_dubai):
+    time_only = dt_dubai.replace(year=2000, month=1, day=1)
+    if SESSION_ASIAN_START <= time_only <= SESSION_ASIAN_END:
+        return 'Asian'
+    elif SESSION_LONDON_START <= time_only <= SESSION_LONDON_END:
+        return 'London'
+    elif SESSION_NY_START <= time_only or time_only <= SESSION_NY_END: # NY session can cross midnight
+        return 'NY'
+    return 'Unknown'
 
-# ═══════════════════════════════════════════════════════════════
-# SMC/ICT ANALYSIS
-# ═══════════════════════════════════════════════════════════════
-def detect_bos(candles: List[Dict], direction: str) -> Tuple[bool, Optional[float]]:
-    """Break of Structure."""
-    if len(candles) < 20:
-        return False, None
-    recent = candles[-20:]
-    current_close = recent[-1]["close"]
-    swing_highs, swing_lows = [], []
-    for i in range(2, len(recent) - 2):
-        if recent[i]["high"] > recent[i-1]["high"] and recent[i]["high"] > recent[i+1]["high"]:
-            swing_highs.append(recent[i]["high"])
-        if recent[i]["low"] < recent[i-1]["low"] and recent[i]["low"] < recent[i+1]["low"]:
-            swing_lows.append(recent[i]["low"])
-    if direction == "BUY" and swing_highs:
-        if current_close > swing_highs[-1]:
-            return True, swing_highs[-1]
-    elif direction == "SELL" and swing_lows:
-        if current_close < swing_lows[-1]:
-            return True, swing_lows[-1]
-    return False, None
-
-
-def detect_order_block(candles: List[Dict], direction: str) -> Tuple[bool, Optional[float], Optional[float]]:
-    """Order Block detection."""
-    if len(candles) < 15:
-        return False, None, None
-    recent = candles[-15:]
-    price = recent[-1]["close"]
-    for i in range(len(recent) - 3, 1, -1):
-        c = recent[i]
-        body = abs(c["close"] - c["open"])
-        if direction == "BUY" and c["close"] < c["open"]:
-            next_move = recent[i+1]["close"] - recent[i+1]["open"]
-            if next_move > body * 1.2:
-                ob_low, ob_high = c["low"], c["open"]
-                if ob_low <= price <= ob_high * 1.003:
-                    return True, ob_low, ob_high
-        elif direction == "SELL" and c["close"] > c["open"]:
-            next_move = recent[i+1]["open"] - recent[i+1]["close"]
-            if next_move > body * 1.2:
-                ob_low, ob_high = c["close"], c["high"]
-                if ob_low * 0.997 <= price <= ob_high:
-                    return True, ob_low, ob_high
-    return False, None, None
-
-
-def detect_fvg(candles: List[Dict], direction: str) -> bool:
-    """Fair Value Gap."""
-    if len(candles) < 10:
+def is_market_open(dt_dubai):
+    # Check if it's Sunday
+    if dt_dubai.weekday() == 6: # Sunday
         return False
-    recent = candles[-10:]
-    for i in range(1, len(recent) - 1):
-        if direction == "BUY":
-            gap = recent[i+1]["low"] - recent[i-1]["high"]
-            if gap > 0.3:
-                return True
-        else:
-            gap = recent[i-1]["low"] - recent[i+1]["high"]
-            if gap > 0.3:
-                return True
-    return False
 
-
-def detect_liquidity_sweep(candles: List[Dict], direction: str) -> bool:
-    """Liquidity sweep / stop hunt."""
-    if len(candles) < 15:
+    # Check daily break
+    time_only = dt_dubai.replace(year=2000, month=1, day=1)
+    if DAILY_BREAK_START <= time_only < DAILY_BREAK_END:
         return False
-    recent = candles[-15:]
-    last = recent[-1]
-    if direction == "BUY":
-        lows = sorted([c["low"] for c in recent[:-1]])[:3]
-        if lows and last["low"] <= min(lows) and last["close"] > min(lows):
-            return True
-    else:
-        highs = sorted([c["high"] for c in recent[:-1]], reverse=True)[:3]
-        if highs and last["high"] >= max(highs) and last["close"] < max(highs):
-            return True
-    return False
 
-
-def detect_displacement(candles: List[Dict], direction: str) -> Tuple[bool, float]:
-    """Displacement / momentum candle."""
-    if len(candles) < 10:
-        return False, 0
-    recent = candles[-10:]
-    bodies = [abs(c["close"] - c["open"]) for c in recent[:-1]]
-    avg_body = sum(bodies) / len(bodies) if bodies else 1
-    last = recent[-1]
-    last_body = abs(last["close"] - last["open"])
-    if avg_body == 0:
-        return False, 0
-    mult = last_body / avg_body
-    if direction == "BUY" and last["close"] > last["open"] and mult >= 1.5:
-        return True, round(mult, 1)
-    elif direction == "SELL" and last["close"] < last["open"] and mult >= 1.5:
-        return True, round(mult, 1)
-    return False, round(mult, 1)
-
-
-def is_premium_discount(candles: List[Dict], price: float, direction: str) -> bool:
-    """Premium/Discount zone check."""
-    if len(candles) < 50:
+    # Check Saturday close
+    if dt_dubai.weekday() == 5 and time_only >= MARKET_CLOSE_SATURDAY.replace(year=2000, month=1, day=1):
         return False
-    recent = candles[-50:]
-    highest = max(c["high"] for c in recent)
-    lowest = min(c["low"] for c in recent)
-    if highest == lowest:
+
+    # Check Monday open
+    if dt_dubai.weekday() == 0 and time_only < MARKET_OPEN_MONDAY.replace(year=2000, month=1, day=1):
         return False
-    mid = (highest + lowest) / 2
-    return (price < mid) if direction == "BUY" else (price > mid)
 
+    return True
 
-def is_near_key_level(candles: List[Dict], price: float) -> Tuple[bool, Optional[str]]:
-    """Key support/resistance level check."""
-    if len(candles) < 50:
-        return False, None
-    recent = candles[-50:]
-    levels = []
-    for i in range(2, len(recent) - 2):
-        if recent[i]["high"] > recent[i-1]["high"] and recent[i]["high"] > recent[i+1]["high"]:
-            levels.append(recent[i]["high"])
-        if recent[i]["low"] < recent[i-1]["low"] and recent[i]["low"] < recent[i+1]["low"]:
-            levels.append(recent[i]["low"])
-    for level in levels:
-        if abs(price - level) < 4.0:
-            return True, f"${level:,.2f}"
-    return False, None
+# --- ALPHA Strategy Logic --- #
+async def check_alpha_strategy(current_candle, m5_candles, h1_candles):
+    if len(m5_candles) < 50 or len(h1_candles) < 50: # Need enough data for EMAs
+        return None, None, None # No signal, no reasons, no confidence
 
+    closes_m5 = np.array([c['close'] for c in m5_candles])
+    opens_m5 = np.array([c['open'] for c in m5_candles])
+    highs_m5 = np.array([c['high'] for c in m5_candles])
+    lows_m5 = np.array([c['low'] for c in m5_candles])
 
-# ═══════════════════════════════════════════════════════════════
-# SIGNAL CHECKLIST
-# ═══════════════════════════════════════════════════════════════
-def run_checklist(price: float, direction: str) -> Tuple[int, List[Dict]]:
-    """Run full checklist (9 items). Returns (score, items)."""
-    checks = []
-    score = 0
+    ema9_m5 = calculate_ema(closes_m5, 9)
+    ema21_m5 = calculate_ema(closes_m5, 21)
+    ema50_m5 = calculate_ema(closes_m5, 50)
+    rsi_m5 = calculate_rsi(closes_m5, 14)
 
-    # 1. HTF Trend (H1)
-    htf = detect_htf_trend(candles_h1)
-    ok = (direction == "BUY" and htf == "BULLISH") or (direction == "SELL" and htf == "BEARISH")
-    checks.append({"name": "HTF Trend", "pass": ok,
-                    "detail": f"{htf} - {'aligned' if ok else 'NOT aligned'}"})
-    if ok: score += 1
+    # Get latest values
+    latest_close = current_candle['close']
+    latest_open = current_candle['open']
+    latest_high = current_candle['high']
+    latest_low = current_candle['low']
+    latest_ema9 = ema9_m5[-1]
+    latest_ema21 = ema21_m5[-1]
+    latest_ema50 = ema50_m5[-1]
+    latest_rsi = rsi_m5[-1]
 
-    # 2. EMA Trend Bias (M5)
-    bias = get_ema_trend_bias(candles_m5)
-    ok = (direction == "BUY" and bias == "BULLISH") or (direction == "SELL" and bias == "BEARISH")
-    checks.append({"name": "EMA Trend", "pass": ok,
-                    "detail": f"{bias} - {'aligned' if ok else 'NOT aligned'}"})
-    if ok: score += 1
+    # Check for NaN values in indicators
+    if any(np.isnan([latest_ema9, latest_ema21, latest_ema50, latest_rsi])):
+        return None, None, None
 
-    # 3. EMA Crossover
-    ema_dir, ef, es = get_ema_signal(candles_m5)
-    ok = ema_dir == direction
-    checks.append({"name": "EMA Cross", "pass": ok,
-                    "detail": f"EMA9={ef} / EMA21={es} {'✓ ' + direction if ok else 'No cross'}"})
-    if ok: score += 1
+    entry_conditions_met = {
+        'EMA_aligned': False,
+        'price_near_EMA21': False,
+        'candle_pattern': False,
+        'RSI_neutral': False,
+        'momentum': False,
+    }
+    reasons = []
+    signal_type = None
 
-    # 4. BOS
-    bos_ok, bos_lv = detect_bos(candles_m5, direction)
-    checks.append({"name": "BOS", "pass": bos_ok,
-                    "detail": f"Confirmed at ${bos_lv:,.2f}" if bos_ok else "Not confirmed"})
-    if bos_ok: score += 1
+    # --- BUY Conditions ---
+    if (latest_ema9 > latest_ema21 > latest_ema50): # Aligned uptrend
+        entry_conditions_met['EMA_aligned'] = True
+        reasons.append('EMA9 > EMA21 > EMA50 ✅')
 
-    # 5. Order Block
-    ob_ok, ob_lo, ob_hi = detect_order_block(candles_m5, direction)
-    checks.append({"name": "Order Block", "pass": ob_ok,
-                    "detail": f"${ob_lo:,.2f}-${ob_hi:,.2f}" if ob_ok else "Not in OB"})
-    if ob_ok: score += 1
+        if abs(latest_close - latest_ema21) <= 4.0: # Price near EMA21
+            entry_conditions_met['price_near_EMA21'] = True
+            reasons.append('Price near EMA21 (within $4) ✅')
 
-    # 6. Liquidity Sweep
-    liq = detect_liquidity_sweep(candles_m5, direction)
-    checks.append({"name": "Liq Sweep", "pass": liq,
-                    "detail": "Detected" if liq else "Not detected"})
-    if liq: score += 1
+            if is_bullish_candle(latest_open, latest_close, latest_high, latest_low): # Bullish candle
+                entry_conditions_met['candle_pattern'] = True
+                reasons.append('Bullish candle ✅')
 
-    # 7. Displacement
-    disp_ok, disp_m = detect_displacement(candles_m5, direction)
-    checks.append({"name": "Displacement", "pass": disp_ok,
-                    "detail": f"Strong ({disp_m}x)" if disp_ok else f"Weak ({disp_m}x)"})
-    if disp_ok: score += 1
+                if 35 <= latest_rsi <= 65: # RSI neutral zone
+                    entry_conditions_met['RSI_neutral'] = True
+                    reasons.append(f'RSI neutral zone ({latest_rsi:.1f}) ✅')
 
-    # 8. RSI filter (not extreme = good for entry direction)
-    rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-    rsi_ok = False
-    if rsi is not None:
-        if direction == "BUY" and rsi < 55:  # Not overbought
-            rsi_ok = True
-        elif direction == "SELL" and rsi > 45:  # Not oversold
-            rsi_ok = True
-    rsi_str = f"{rsi}" if rsi else "N/A"
-    checks.append({"name": "RSI", "pass": rsi_ok,
-                    "detail": f"{rsi_str} - {'OK' if rsi_ok else 'Against direction'}"})
-    if rsi_ok: score += 1
+                    if latest_close > closes_m5[-4]: # Momentum (close > close[3])
+                        entry_conditions_met['momentum'] = True
+                        reasons.append('Momentum positive (close > close[3]) ✅')
 
-    # 9. R:R ratio
-    rr = TP1_DOLLARS / SL_DOLLARS
-    ok = rr >= 2.0
-    checks.append({"name": "R:R", "pass": ok,
-                    "detail": f"1:{rr:.1f} (SL ${SL_DOLLARS} / TP ${TP1_DOLLARS})"})
-    if ok: score += 1
+                        # All BUY conditions met
+                        signal_type = 'BUY'
 
-    return score, checks
+    # --- SELL Conditions ---
+    elif (latest_ema9 < latest_ema21 < latest_ema50): # Aligned downtrend
+        entry_conditions_met['EMA_aligned'] = True
+        reasons.append('EMA9 < EMA21 < EMA50 ✅')
 
+        if abs(latest_close - latest_ema21) <= 4.0: # Price near EMA21
+            entry_conditions_met['price_near_EMA21'] = True
+            reasons.append('Price near EMA21 (within $4) ✅')
 
-# ═══════════════════════════════════════════════════════════════
-# TRADE MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
-def load_data():
-    global trade_history, signal_log, active_trade, signal_count_today, last_reset_date
-    for path, target, default in [
-        (TRADE_HISTORY_FILE, "trade_history", []),
-        (SIGNAL_LOG_FILE, "signal_log", []),
-    ]:
-        try:
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    globals()[target] = json.load(f)
-        except Exception as e:
-            logger.error(f"Load {path}: {e}")
-            globals()[target] = default
-    try:
-        if os.path.exists(BOT_STATE_FILE):
-            with open(BOT_STATE_FILE, "r") as f:
-                st = json.load(f)
-                active_trade = st.get("active_trade")
-                signal_count_today = st.get("signal_count_today", 0)
-                last_reset_date = st.get("last_reset_date", "")
-    except Exception as e:
-        logger.error(f"Load state: {e}")
+            if is_bearish_candle(latest_open, latest_close, latest_high, latest_low): # Bearish candle
+                entry_conditions_met['candle_pattern'] = True
+                reasons.append('Bearish candle ✅')
 
+                if 35 <= latest_rsi <= 65: # RSI neutral zone
+                    entry_conditions_met['RSI_neutral'] = True
+                    reasons.append(f'RSI neutral zone ({latest_rsi:.1f}) ✅')
 
-def save_data():
-    try:
-        with open(TRADE_HISTORY_FILE, "w") as f:
-            json.dump(trade_history, f, indent=2, default=str)
-        with open(SIGNAL_LOG_FILE, "w") as f:
-            json.dump(signal_log, f, indent=2, default=str)
-        with open(BOT_STATE_FILE, "w") as f:
-            json.dump({"active_trade": active_trade,
-                        "signal_count_today": signal_count_today,
-                        "last_reset_date": last_reset_date}, f, indent=2, default=str)
-    except Exception as e:
-        logger.error(f"Save error: {e}")
+                    if latest_close < closes_m5[-4]: # Momentum (close < close[3])
+                        entry_conditions_met['momentum'] = True
+                        reasons.append('Momentum negative (close < close[3]) ✅')
 
+                        # All SELL conditions met
+                        signal_type = 'SELL'
 
-def reset_daily_counters():
-    global signal_count_today, last_reset_date
-    today = now_dubai().date().isoformat()
-    if today != last_reset_date:
-        signal_count_today = 0
-        last_reset_date = today
-        save_data()
-
-
-def get_daily_pnl() -> float:
-    today = now_dubai().date().isoformat()
-    return sum(t.get("pnl", 0) for t in trade_history if t.get("date") == today)
-
-
-# ═══════════════════════════════════════════════════════════════
-# SIGNAL GENERATION
-# ═══════════════════════════════════════════════════════════════
-async def generate_signal(context: ContextTypes.DEFAULT_TYPE, price: float):
-    """Generate signal based on EMA crossover + SMC/ICT confirmation."""
-    global cooldown_until, signal_count_today, active_signal_msg_id, last_ema_cross
-
-    # Guards
-    if not is_market_open():
-        return
-    if active_trade or active_signal_msg_id:
-        return
-    if time.time() < cooldown_until:
-        return
-    if signal_count_today >= MAX_DAILY_TRADES:
-        return
-    if get_daily_pnl() <= DAILY_LOSS_LIMIT:
-        return
-    if len(candles_m5) < 50 or len(candles_h1) < 20:
-        return
-
-    # Step 1: Determine direction from HTF trend (primary) + M5 EMA (confirmation)
-    htf = detect_htf_trend(candles_h1)
-    ema_dir, ema_fast, ema_slow = get_ema_signal(candles_m5)
-    bias = get_ema_trend_bias(candles_m5)
+    # Calculate total confidence score for the signal
+    total_confidence = 0
+    present_conditions_count = 0
+    for condition, met in entry_conditions_met.items():
+        if met:
+            total_confidence += bot_state.learning_state['confidence_scores'].get(condition, INITIAL_CONFIDENCE)
+            present_conditions_count += 1
     
-    # Direction logic: HTF trend is primary
-    rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-    direction = None
-    if htf == "BULLISH":
-        # HTF bullish - look for BUY entries
-        # Allow if: M5 aligned, OR M5 ranging, OR RSI dipped (pullback buy)
-        if bias == "BULLISH" or ema_dir == "BUY":
-            direction = "BUY"
-        elif bias == "RANGING":
-            direction = "BUY"
-        elif rsi is not None and rsi < 45:
-            direction = "BUY"  # Pullback in bullish trend
-    elif htf == "BEARISH":
-        # HTF bearish - look for SELL entries
-        # Allow if: M5 aligned, OR M5 ranging, OR RSI bounced (rally sell)
-        if bias == "BEARISH" or ema_dir == "SELL":
-            direction = "SELL"
-        elif bias == "RANGING":
-            direction = "SELL"
-        elif rsi is not None and rsi > 55:
-            direction = "SELL"  # Rally in bearish trend (sell the bounce)
+    if present_conditions_count > 0:
+        total_confidence = total_confidence / present_conditions_count
     else:
-        # HTF ranging - use M5 EMA direction
-        if ema_dir is not None:
-            direction = ema_dir
-        elif bias == "BULLISH":
-            direction = "BUY"
-        elif bias == "BEARISH":
-            direction = "SELL"
-    
-    if direction is None:
-        return  # No clear direction
+        total_confidence = 0
 
-    # Avoid duplicate signals for same direction
-    if direction == last_ema_cross:
+    # Apply session confidence modifier
+    current_dubai_time = datetime.now(DUBAI_TZ)
+    session_name = get_current_session(current_dubai_time)
+    session_modifier = bot_state.get_session_confidence_modifier(session_name)
+    total_confidence += session_modifier
+
+    return signal_type, reasons, total_confidence, latest_rsi, session_name, entry_conditions_met
+
+# --- Telegram Bot Functions --- #
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.message.reply_html(
+        f"Hi {user.mention_html()}! I am the PawOo Gold Signal Bot (v5.0). "
+        "I send XAU/USD BUY/SELL signals based on the ALPHA strategy with a self-learning adaptive system. "
+        "Use /help to see available commands."
+    )
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Scanning for signals... Please wait.")
+    await auto_scan_for_signals(context, manual_scan=True, chat_id=update.effective_chat.id)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_state._reset_daily_stats()
+    today_wr = (bot_state.today_wins / bot_state.today_trades_count) * 100 if bot_state.today_trades_count > 0 else 0
+    last_10_trades = bot_state.trade_journal[-10:]
+    wr_10 = (sum(1 for t in last_10_trades if t['result'] == 'WIN') / len(last_10_trades)) * 100 if last_10_trades else 0
+
+    status_text = f"📊 Bot Status 📊\n\n"
+    status_text += f"Today's Trades: {bot_state.today_wins}/{bot_state.today_trades_count} ({today_wr:.2f}% WR)\n"
+    status_text += f"Last 10 Trades WR: {wr_10:.2f}%\n"
+    status_text += f"Current Confidence Threshold: {bot_state.learning_state['current_confidence_threshold']:.2f}%\n"
+    status_text += f"Trading Paused: {'Yes' if bot_state.learning_state['adaptive_threshold_settings']['extra_filter_active'] else 'No'}\n"
+    status_text += f"Last Signal Time: {bot_state.last_signal_time.strftime('%Y-%m-%d %H:%M:%S %Z') if bot_state.last_signal_time else 'N/A'}\n"
+    
+    current_dubai_time = datetime.now(DUBAI_TZ)
+    status_text += f"Market Open: {is_market_open(current_dubai_time)}\n"
+    status_text += f"Current Session: {get_current_session(current_dubai_time)}\n"
+
+    await update.message.reply_text(status_text)
+
+async def journal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    journal_entries = bot_state.trade_journal[-10:] # Last 10 trades
+    if not journal_entries:
+        await update.message.reply_text("Trade journal is empty.")
+        return
+
+    journal_text = "📜 Last 10 Trade Journal Entries 📜\n\n"
+    for entry in journal_entries:
+        journal_text += f"Time: {entry['timestamp']}\n"
+        journal_text += f"Type: {entry['signal_type']} @ {entry['entry_price']:.2f}\n"
+        journal_text += f"Result: {entry['result']} (PnL: {entry['pnl']:.2f}, Bars Held: {entry['bars_held']})\n"
+        journal_text += f"Confidence: {entry['signal_confidence']:.2f}%\n"
+        journal_text += f"Session: {entry['session']}\n"
+        journal_text += f"---\n"
+    await update.message.reply_text(journal_text)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    total_trades = len(bot_state.trade_journal)
+    total_wins = sum(1 for t in bot_state.trade_journal if t['result'] == 'WIN')
+    overall_wr = (total_wins / total_trades) * 100 if total_trades > 0 else 0
+
+    stats_text = f"📈 Overall Statistics 📈\n\n"
+    stats_text += f"Total Trades: {total_trades}\n"
+    stats_text += f"Overall Win Rate: {overall_wr:.2f}%\n\n"
+
+    stats_text += "Session Breakdown:\n"
+    for session, data in bot_state.learning_state['session_performance'].items():
+        session_wr = (data['wins'] / data['trades']) * 100 if data['trades'] > 0 else 0
+        stats_text += f"  {session}: {data['trades']} trades, {data['wins']} wins, {session_wr:.2f}% WR (Confidence Modifier: {bot_state.get_session_confidence_modifier(session)}%)\n"
+    
+    await update.message.reply_text(stats_text)
+
+async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    learn_text = f"🧠 Current Learning State 🧠\n\n"
+    learn_text += f"Confidence Scores (Higher = More Important):\n"
+    for condition, score in bot_state.learning_state['confidence_scores'].items():
+        learn_text += f"  - {condition}: {score:.2f}%\n"
+    learn_text += f"\nCurrent Signal Confidence Threshold: {bot_state.learning_state['current_confidence_threshold']:.2f}%\n"
+    learn_text += f"Base Adaptive Threshold: {bot_state.learning_state['adaptive_threshold_settings']['base_threshold']:.2f}%\n"
+    learn_text += f"Tight Filter Active: {bot_state.learning_state['adaptive_threshold_settings']['tight_filter_active']}\n"
+    learn_text += f"Extra Filter Active (Trading Paused): {bot_state.learning_state['adaptive_threshold_settings']['extra_filter_active']}\n"
+    learn_text += f"Last Weekly Review: {datetime.fromisoformat(bot_state.learning_state['last_weekly_review']).astimezone(DUBAI_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+
+    await update.message.reply_text(learn_text)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
         return
     
-    # Step 2: RSI filter - don't buy overbought, don't sell oversold
-    if rsi is None:
-        rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-    if rsi is not None:
-        if direction == "BUY" and rsi > RSI_OVERBOUGHT:
-            return
-        if direction == "SELL" and rsi < RSI_OVERSOLD:
-            return
+    bot_state.trade_journal = []
+    bot_state.learning_state = bot_state._get_initial_learning_state()
+    bot_state.active_trades = {}
+    bot_state.last_signal_time = None
+    bot_state._reset_daily_stats()
+    save_json(TRADE_JOURNAL_PATH, bot_state.trade_journal)
+    save_json(LEARNING_STATE_PATH, bot_state.learning_state)
+    await update.message.reply_text("Learning data has been reset.")
+    logger.info("Learning data reset by admin.")
 
-    # Step 3: Run full checklist
-    score, checks = run_checklist(price, direction)
-    if score < MIN_CHECKLIST_SCORE:
+async def send_signal_message(chat_id, signal_type, entry_price, tp, sl, confidence, threshold, trend, rsi_val, session, reasons, learning_stats):
+    emoji = "🟢" if signal_type == 'BUY' else "🔴"
+    message_text = f"{emoji} {signal_type} SIGNAL - XAU/USD\n\n"
+    message_text += f"📊 Entry: ${entry_price:.2f}\n"
+    message_text += f"🎯 TP: ${tp:.2f} (+${TP_AMOUNT})\n"
+    message_text += f"🛑 SL: ${sl:.2f} (-${SL_AMOUNT})\n"
+    message_text += f"📐 R:R = 1:1.6\n\n"
+    message_text += f"📋 Strategy: EMA21 Bounce (ALPHA)\n"
+    message_text += f"💪 Confidence: {confidence:.2f}% (threshold: {threshold:.2f}%)\n"
+    message_text += f"📈 Trend: {trend}\n"
+    message_text += f"📊 RSI(14): {rsi_val:.1f}\n"
+    message_text += f"⏰ Session: {session}\n\n"
+    message_text += f"📝 Entry Reasons:\n"
+    for reason in reasons:
+        message_text += f"• {reason}\n"
+    message_text += f"\n📊 Learning Stats:\n"
+    message_text += f"• Today: {learning_stats['today_wins']}/{learning_stats['today_trades']} ({learning_stats['today_wr']:.2f}% WR)\n"
+    message_text += f"• Last 10: {learning_stats['last_10_wr']:.2f}% WR\n"
+    message_text += f"• This session avg: {learning_stats['session_wr']:.2f}% WR\n\n"
+    message_text += f"⚠️ Risk: 0.5 lot | Max loss ${SL_AMOUNT}"
+
+    await application.bot.send_message(chat_id=chat_id, text=message_text)
+
+async def send_result_notification(chat_id, trade_entry):
+    emoji = "✅" if trade_entry['result'] == 'WIN' else "❌" if trade_entry['result'] == 'LOSS' else "⚠️"
+    message_text = f"{emoji} TRADE RESULT - XAU/USD {trade_entry['signal_type']}\n\n"
+    message_text += f"Entry: ${trade_entry['entry_price']:.2f}\n"
+    message_text += f"Exit: ${trade_entry['exit_price']:.2f}\n"
+    message_text += f"Result: {trade_entry['result']}\n"
+    message_text += f"PnL: ${trade_entry['pnl']:.2f}\n"
+    message_text += f"Bars Held: {trade_entry['bars_held']}\n"
+    message_text += f"Timestamp: {trade_entry['timestamp']}\n"
+    await application.bot.send_message(chat_id=chat_id, text=message_text)
+
+# --- Auto-Scanning and Trade Monitoring --- #
+async def auto_scan_for_signals(context: ContextTypes.DEFAULT_TYPE, manual_scan=False, chat_id=None) -> None:
+    job = context.job
+    if not manual_scan:
+        chat_id = ADMIN_CHAT_ID # Default for auto-scan
+
+    current_dubai_time = datetime.now(DUBAI_TZ)
+    if not is_market_open(current_dubai_time):
+        logger.info("Market is closed or on daily break. Skipping scan.")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text="Market is currently closed or on daily break. Cannot scan for signals.")
         return
-    
-    ema_dir = direction
 
-    # Signal confirmed!
-    last_ema_cross = ema_dir
-    direction = ema_dir
+    bot_state._reset_daily_stats()
 
-    if direction == "BUY":
-        sl = price - SL_DOLLARS
-        tp1 = price + TP1_DOLLARS
-        tp2 = price + TP2_DOLLARS
-    else:
-        sl = price + SL_DOLLARS
-        tp1 = price - TP1_DOLLARS
-        tp2 = price - TP2_DOLLARS
+    # Cooldown check
+    if bot_state.last_signal_time and (current_dubai_time - bot_state.last_signal_time).total_seconds() < COOLDOWN_MINUTES * 60:
+        logger.info(f"Cooldown active. Next signal possible in {int(COOLDOWN_MINUTES - (current_dubai_time - bot_state.last_signal_time).total_seconds() / 60)} minutes.")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text=f"Cooldown active. Please wait {int(COOLDOWN_MINUTES - (current_dubai_time - bot_state.last_signal_time).total_seconds() / 60)} minutes before scanning again.")
+        return
 
-    session = get_session()
-    rsi_str = f"{rsi}" if rsi else "N/A"
+    # Max trades per day check
+    if bot_state.today_trades_count >= MAX_TRADES_PER_DAY:
+        logger.info(f"Max trades ({MAX_TRADES_PER_DAY}) reached for today. Skipping scan.")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text=f"Max trades ({MAX_TRADES_PER_DAY}) reached for today. No more signals will be sent.")
+        return
 
-    checklist_text = ""
-    for item in checks:
-        e = "✅" if item["pass"] else "❌"
-        checklist_text += f"\n{e} {item['name']}: {item['detail']}"
+    # Check if trading is paused by adaptive system
+    if bot_state.learning_state['adaptive_threshold_settings']['extra_filter_active']:
+        logger.warning("Trading is paused by adaptive system due to low 20-trade WR. Skipping scan.")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text="Trading is currently paused by the adaptive system due to low 20-trade win rate. Please check /learn for details.")
+        return
 
-    msg = f"""🔔 NEW TRADE SIGNAL!
-━━━━━━━━━━━━━━━━━
-📊 {direction} @ ${price:,.2f}
-🔴 SL: ${sl:,.2f} (${SL_DOLLARS} = -${SL_DOLLARS * LOT_SIZE * 100 * PIP_VALUE:.2f})
-🎯 TP1: ${tp1:,.2f} (${TP1_DOLLARS} = +${TP1_DOLLARS * LOT_SIZE * 100 * PIP_VALUE:.2f})
-🎯 TP2: ${tp2:,.2f}
-🏷 Lot: {LOT_SIZE} | R:R 1:{TP1_DOLLARS/SL_DOLLARS:.1f} | RSI: {rsi_str}
-📈 EMA9: {ema_fast} | EMA21: {ema_slow}
+    # Fetch price data
+    m5_candles = await get_yahoo_finance_data(interval='5m', range_param='7d') # Need enough for 50 EMA
+    h1_candles = await get_yahoo_finance_data(interval='60m', range_param='5d') # For HTF trend (not fully implemented in ALPHA yet)
 
-📋 Checklist: {score}/9{checklist_text}
+    if not m5_candles or not h1_candles:
+        logger.error("Could not fetch sufficient price data.")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text="Error: Could not fetch price data. Please try again later.")
+        return
 
-🏛 XM Micro | {LOT_SIZE} lot
-🕐 Session: {session}
-📡 {len(candles_m5)} M5 + {len(candles_h1)} H1 candles
-━━━━━━━━━━━━━━━━━"""
+    current_candle = m5_candles[-1]
+    signal_type, reasons, total_confidence, rsi_val, session_name, entry_conditions_met = await check_alpha_strategy(current_candle, m5_candles, h1_candles)
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ ဝင်မယ်", callback_data=f"enter_{direction}_{price}_{sl}_{tp1}_{tp2}"),
-        InlineKeyboardButton("❌ Skip", callback_data="skip"),
-        InlineKeyboardButton("⏰ Wait", callback_data="wait_signal")
-    ]])
+    if signal_type and total_confidence >= bot_state.learning_state['current_confidence_threshold']:
+        entry_price = current_candle['close']
+        if signal_type == 'BUY':
+            tp = entry_price + TP_AMOUNT
+            sl = entry_price - SL_AMOUNT
+            trend = "Strong Bullish (EMA aligned)"
+        else: # SELL
+            tp = entry_price - TP_AMOUNT
+            sl = entry_price + SL_AMOUNT
+            trend = "Strong Bearish (EMA aligned)"
 
-    sent = await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg, reply_markup=keyboard)
-    active_signal_msg_id = sent.message_id
-
-    signal_log.append({
-        "time": now_dubai().isoformat(), "direction": direction, "price": price,
-        "sl": sl, "tp1": tp1, "rsi": rsi, "score": score, "session": session,
-        "ema_fast": ema_fast, "ema_slow": ema_slow
-    })
-    signal_count_today += 1
-    cooldown_until = time.time() + COOLDOWN_SECONDS
-    save_data()
-    logger.info(f"Signal: {direction} @ ${price:,.2f} | EMA {ema_fast}/{ema_slow} | RSI {rsi} | Score {score}/9")
-
-
-# ═══════════════════════════════════════════════════════════════
-# CALLBACKS
-# ═══════════════════════════════════════════════════════════════
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_trade, active_signal_msg_id
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("enter_"):
-        parts = data.split("_")
-        direction, entry_price = parts[1], float(parts[2])
-        sl, tp1, tp2 = float(parts[3]), float(parts[4]), float(parts[5])
-        active_trade = {
-            "direction": direction, "entry": entry_price, "sl": sl,
-            "tp1": tp1, "tp2": tp2, "time": now_dubai().isoformat(),
-            "date": now_dubai().date().isoformat(), "session": get_session()
+        # Prepare learning stats for signal message
+        today_wr = (bot_state.today_wins / bot_state.today_trades_count) * 100 if bot_state.today_trades_count > 0 else 0
+        last_10_trades = bot_state.trade_journal[-10:]
+        wr_10 = (sum(1 for t in last_10_trades if t['result'] == 'WIN') / len(last_10_trades)) * 100 if last_10_trades else 0
+        session_data = bot_state.learning_state['session_performance'].get(session_name, {'trades': 0, 'wins': 0})
+        session_wr = (session_data['wins'] / session_data['trades']) * 100 if session_data['trades'] > 0 else 0
+        learning_stats = {
+            'today_wins': bot_state.today_wins,
+            'today_trades': bot_state.today_trades_count,
+            'today_wr': today_wr,
+            'last_10_wr': wr_10,
+            'session_wr': session_wr
         }
-        active_signal_msg_id = None
-        save_data()
-        await query.edit_message_text(
-            query.message.text + f"\n\n✅ ENTERED! {direction} @ ${entry_price:,.2f}\n⏳ Monitoring..."
-        )
-    elif data == "skip":
-        active_signal_msg_id = None
-        await query.edit_message_text(query.message.text + "\n\n❌ Signal Skipped")
-    elif data == "wait_signal":
-        await query.edit_message_text(query.message.text + "\n\n⏰ Waiting 5 min...")
-        asyncio.create_task(expire_signal(context, query.message.message_id))
 
+        await send_signal_message(chat_id, signal_type, entry_price, tp, sl, total_confidence, bot_state.learning_state['current_confidence_threshold'], trend, rsi_val, session_name, reasons, learning_stats)
+        bot_state.last_signal_time = current_dubai_time
 
-async def expire_signal(context, msg_id):
-    global active_signal_msg_id
-    await asyncio.sleep(300)
-    if active_signal_msg_id == msg_id:
-        active_signal_msg_id = None
-        try:
-            await context.bot.edit_message_text(
-                chat_id=ADMIN_CHAT_ID, message_id=msg_id,
-                text="⏰ Signal expired (5 min timeout)"
-            )
-        except:
-            pass
-
-
-# ═══════════════════════════════════════════════════════════════
-# TRADE MONITORING
-# ═══════════════════════════════════════════════════════════════
-async def monitor_active_trade(context: ContextTypes.DEFAULT_TYPE, price: float):
-    global active_trade
-    if not active_trade:
-        return
-    d = active_trade["direction"]
-    entry, sl, tp1 = active_trade["entry"], active_trade["sl"], active_trade["tp1"]
-    hit = None
-    if d == "BUY":
-        if price <= sl: hit = "SL"
-        elif price >= tp1: hit = "TP1"
+        trade_id = f"{signal_type}_{current_dubai_time.isoformat()}"
+        bot_state.active_trades[trade_id] = {
+            'signal_type': signal_type,
+            'entry_price': entry_price,
+            'tp': tp,
+            'sl': sl,
+            'entry_time': current_dubai_time,
+            'signal_confidence': total_confidence,
+            'entry_conditions_met': entry_conditions_met,
+            'session': session_name,
+            'bars_held': 0
+        }
+        logger.info(f"Signal sent: {signal_type} at {entry_price:.2f} with confidence {total_confidence:.2f}%")
+        asyncio.create_task(monitor_trade_outcome(context, trade_id, chat_id))
     else:
-        if price >= sl: hit = "SL"
-        elif price <= tp1: hit = "TP1"
-    if hit:
-        move = (price - entry) if d == "BUY" else (entry - price)
-        pnl = round(move * LOT_SIZE * 100 * PIP_VALUE, 2)
-        result = "WIN" if pnl > 0 else "LOSS"
-        trade_history.append({
-            **active_trade, "exit_price": price, "exit_time": now_dubai().isoformat(),
-            "result": result, "pnl": pnl, "hit": hit
-        })
-        active_trade = None
-        save_data()
-        emoji = "🟢" if result == "WIN" else "🔴"
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-            text=f"""{emoji} TRADE CLOSED - {result}!
-━━━━━━━━━━━━━━━━━
-📊 {d} @ ${entry:,.2f} → ${price:,.2f} ({hit})
-💰 PnL: ${pnl:+.2f}
-━━━━━━━━━━━━━━━━━""")
+        logger.info(f"No signal or confidence too low ({total_confidence:.2f}% < {bot_state.learning_state['current_confidence_threshold']:.2f}%).")
+        if manual_scan:
+            await application.bot.send_message(chat_id=chat_id, text=f"No signal found or confidence too low ({total_confidence:.2f}% < {bot_state.learning_state['current_confidence_threshold']:.2f}%).")
 
-
-# ═══════════════════════════════════════════════════════════════
-# COMMANDS
-# ═══════════════════════════════════════════════════════════════
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"""🤖 PawOo Gold Signal Bot v{VERSION}
-━━━━━━━━━━━━━━━━━
-📊 Strategy: EMA(9/21) + SMC/ICT Hybrid
-📈 Pair: XAU/USD (Gold)
-🏛 Broker: XM Micro (GOLDm#)
-
-Commands:
-/scan - Force scan
-/price - Price & indicators
-/status - Performance
-/close [price] - Close trade
-
-EMA crossover + SMC confirmation
-Min score: {MIN_CHECKLIST_SCORE}/9 for signal
-━━━━━━━━━━━━━━━━━""")
-
-
-async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price = fetch_spot_price()
-    fetch_candles()
-    rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-    htf = detect_htf_trend(candles_h1)
-    bias = get_ema_trend_bias(candles_m5)
-    _, ef, es = get_ema_signal(candles_m5)
-    session = get_session()
-    market = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
-    await update.message.reply_text(f"""📊 Gold Price & Analysis
-━━━━━━━━━━━━━━━━━
-💰 Price: ${price:,.2f if price else 0}
-📉 RSI(14): {rsi or 'N/A'}
-📈 EMA9: {ef} | EMA21: {es}
-📈 M5 Bias: {bias} | H1 Trend: {htf}
-🕐 {session} | {market}
-📡 {len(candles_m5)} M5 + {len(candles_h1)} H1
-━━━━━━━━━━━━━━━━━""")
-
-
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price = fetch_spot_price()
-    fetch_candles()
-    if not price:
-        await update.message.reply_text("❌ Cannot fetch price.")
+async def monitor_trade_outcome(context: ContextTypes.DEFAULT_TYPE, trade_id: str, chat_id: int) -> None:
+    trade = bot_state.active_trades.get(trade_id)
+    if not trade:
         return
 
-    rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-    htf = detect_htf_trend(candles_h1)
-    ema_dir, ef, es = get_ema_signal(candles_m5)
-    bias = get_ema_trend_bias(candles_m5)
+    logger.info(f"Monitoring trade {trade_id}...")
+    entry_time = trade['entry_time']
 
-    buy_score, buy_checks = run_checklist(price, "BUY")
-    sell_score, sell_checks = run_checklist(price, "SELL")
-    best_dir = "BUY" if buy_score >= sell_score else "SELL"
-    best_score = max(buy_score, sell_score)
-    best_checks = buy_checks if buy_score >= sell_score else sell_checks
+    while True:
+        await asyncio.sleep(30) # Monitor every 30 seconds
+        
+        current_dubai_time = datetime.now(DUBAI_TZ)
+        if not is_market_open(current_dubai_time):
+            logger.info(f"Market closed during monitoring of trade {trade_id}. Closing as timeout.")
+            trade_entry = {
+                'timestamp': current_dubai_time.isoformat(),
+                'signal_type': trade['signal_type'],
+                'entry_price': trade['entry_price'],
+                'exit_price': trade['entry_price'], # Exit at entry price for timeout
+                'result': 'TIMEOUT',
+                'pnl': 0.0,
+                'bars_held': trade['bars_held'],
+                'signal_confidence': trade['signal_confidence'],
+                'entry_conditions_met': trade['entry_conditions_met'],
+                'session': trade['session'],
+                'market_conditions': 'N/A' # Placeholder
+            }
+            bot_state.record_trade(trade_entry)
+            await send_result_notification(chat_id, trade_entry)
+            del bot_state.active_trades[trade_id]
+            return
 
-    checklist_text = ""
-    for item in best_checks:
-        e = "✅" if item["pass"] else "❌"
-        checklist_text += f"\n{e} {item['name']}: {item['detail']}"
+        # Check for trade timeout
+        if (current_dubai_time - entry_time).total_seconds() > TRADE_TIMEOUT_HOURS * 3600:
+            logger.info(f"Trade {trade_id} timed out.")
+            trade_entry = {
+                'timestamp': current_dubai_time.isoformat(),
+                'signal_type': trade['signal_type'],
+                'entry_price': trade['entry_price'],
+                'exit_price': trade['entry_price'], # Exit at entry price for timeout
+                'result': 'TIMEOUT',
+                'pnl': 0.0,
+                'bars_held': trade['bars_held'],
+                'signal_confidence': trade['signal_confidence'],
+                'entry_conditions_met': trade['entry_conditions_met'],
+                'session': trade['session'],
+                'market_conditions': 'N/A' # Placeholder
+            }
+            bot_state.record_trade(trade_entry)
+            await send_result_notification(chat_id, trade_entry)
+            del bot_state.active_trades[trade_id]
+            return
 
-    status = "✅ Signal ready!" if best_score >= MIN_CHECKLIST_SCORE else f"⏳ Need {MIN_CHECKLIST_SCORE - best_score} more"
-    ema_cross_str = f"→ {ema_dir}" if ema_dir else "No cross"
+        # Fetch latest price to check TP/SL
+        m5_candles = await get_yahoo_finance_data(interval='5m', range_param='1d')
+        if not m5_candles:
+            logger.error("Could not fetch price data for trade monitoring.")
+            continue
+        
+        latest_candle = m5_candles[-1]
+        current_price = latest_candle['close']
+        trade['bars_held'] += 1 # Increment bars held
 
-    msg = f"""🔍 Scan Result
-━━━━━━━━━━━━━━━━━
-💰 ${price:,.2f} | RSI: {rsi} | H1: {htf}
-📈 EMA9: {ef} | EMA21: {es} | {ema_cross_str}
-📈 M5 Bias: {bias}
+        result = None
+        pnl = 0.0
+        exit_price = current_price
 
-📋 Best: {best_dir} ({best_score}/9) {status}
-{checklist_text}
+        if trade['signal_type'] == 'BUY':
+            if current_price >= trade['tp']:
+                result = 'WIN'
+                pnl = TP_AMOUNT
+                exit_price = trade['tp']
+            elif current_price <= trade['sl']:
+                result = 'LOSS'
+                pnl = -SL_AMOUNT
+                exit_price = trade['sl']
+        else: # SELL
+            if current_price <= trade['tp']:
+                result = 'WIN'
+                pnl = TP_AMOUNT
+                exit_price = trade['tp']
+            elif current_price >= trade['sl']:
+                result = 'LOSS'
+                pnl = -SL_AMOUNT
+                exit_price = trade['sl']
 
-📡 {len(candles_m5)} M5 + {len(candles_h1)} H1
-━━━━━━━━━━━━━━━━━"""
-    await update.message.reply_text(msg)
+        if result:
+            logger.info(f"Trade {trade_id} resulted in {result}.")
+            trade_entry = {
+                'timestamp': current_dubai_time.isoformat(),
+                'signal_type': trade['signal_type'],
+                'entry_price': trade['entry_price'],
+                'exit_price': exit_price,
+                'result': result,
+                'pnl': pnl,
+                'bars_held': trade['bars_held'],
+                'signal_confidence': trade['signal_confidence'],
+                'entry_conditions_met': trade['entry_conditions_met'],
+                'session': trade['session'],
+                'market_conditions': 'N/A' # Placeholder
+            }
+            bot_state.record_trade(trade_entry)
+            await send_result_notification(chat_id, trade_entry)
+            del bot_state.active_trades[trade_id]
+            return
 
-    if best_score >= MIN_CHECKLIST_SCORE and is_market_open():
-        if not active_trade and not active_signal_msg_id:
-            if time.time() >= cooldown_until and signal_count_today < MAX_DAILY_TRADES:
-                await generate_signal(context, price)
+async def weekly_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_state.weekly_self_review()
 
+# --- Main Bot Setup --- #
+def main() -> None:
+    # Create data directory if it doesn't exist
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(WEEKLY_REPORTS_DIR, exist_ok=True)
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = [t for t in trade_history if t.get("result") in ("WIN", "LOSS")]
-    wins = len([t for t in total if t["result"] == "WIN"])
-    wr = (wins / len(total) * 100) if total else 0
-    total_pnl = sum(t.get("pnl", 0) for t in trade_history)
-    today_pnl = get_daily_pnl()
-    market = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
-    session = get_session()
-    trade_str = ""
-    if active_trade:
-        p = fetch_spot_price()
-        if p:
-            d = active_trade["direction"]
-            e = active_trade["entry"]
-            mv = (p - e) if d == "BUY" else (e - p)
-            pnl = mv * LOT_SIZE * 100 * PIP_VALUE
-            trade_str = f"\n\n📊 Active: {d} @ ${e:,.2f}\n💰 PnL: ${pnl:+.2f}"
-    await update.message.reply_text(f"""📊 PawOo v{VERSION} Status
-━━━━━━━━━━━━━━━━━
-{market} | {session}
-📈 Signals: {signal_count_today}/{MAX_DAILY_TRADES} | Today: ${today_pnl:+.2f}
-🎯 Win Rate: {wr:.0f}% ({wins}/{len(total)})
-💰 Total PnL: ${total_pnl:+.2f}
-📝 Signals: {len(signal_log)}{trade_str}
-━━━━━━━━━━━━━━━━━""")
+    application = Application.builder().token(BOT_TOKEN).build()
 
+    # Command Handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("journal", journal_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("learn", learn_command))
+    application.add_handler(CommandHandler("reset", reset_command))
 
-async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_trade
-    if not active_trade:
-        await update.message.reply_text("❌ No active trade.")
-        return
-    parts = update.message.text.strip().split()
-    try:
-        cp = float(parts[1].replace("$", "").replace(",", "")) if len(parts) > 1 else fetch_spot_price()
-    except:
-        cp = fetch_spot_price()
-    if not cp:
-        await update.message.reply_text("❌ Cannot get price. /close 4550.00")
-        return
-    d, e = active_trade["direction"], active_trade["entry"]
-    mv = (cp - e) if d == "BUY" else (e - cp)
-    pnl = round(mv * LOT_SIZE * 100 * PIP_VALUE, 2)
-    result = "WIN" if pnl > 0 else "LOSS"
-    trade_history.append({**active_trade, "exit_price": cp, "exit_time": now_dubai().isoformat(),
-                          "result": result, "pnl": pnl, "hit": "Manual"})
-    active_trade = None
-    save_data()
-    emoji = "🟢" if result == "WIN" else "🔴"
-    await update.message.reply_text(f"""{emoji} Closed - {result}
-━━━━━━━━━━━━━━━━━
-📊 {d} @ ${e:,.2f} → ${cp:,.2f}
-💰 PnL: ${pnl:+.2f}
-━━━━━━━━━━━━━━━━━""")
+    # Job Queue for auto-scanning and weekly review
+    job_queue = application.job_queue
+    # Scan every 30 seconds
+    job_queue.run_repeating(auto_scan_for_signals, interval=30, first=10, data={'chat_id': ADMIN_CHAT_ID})
+    # Weekly review every Sunday at a specific time (e.g., 01:00 Dubai time)
+    job_queue.run_daily(weekly_review_job, time=MARKET_OPEN_MONDAY.replace(hour=1, minute=0, second=0).timetz(), days=(6,), tzinfo=DUBAI_TZ)
 
+    logger.info("Bot started polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# ═══════════════════════════════════════════════════════════════
-# MESSAGE HANDLER
-# ═══════════════════════════════════════════════════════════════
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        return
-    text = update.message.text.lower().strip()
-    if any(w in text for w in ["hi", "hello", "yo", "bot", "status", "update"]):
-        price = fetch_spot_price()
-        fetch_candles()
-        rsi = calculate_rsi(candles_m5, RSI_PERIOD)
-        htf = detect_htf_trend(candles_h1)
-        bias = get_ema_trend_bias(candles_m5)
-        _, ef, es = get_ema_signal(candles_m5)
-        session = get_session()
-        market = "OPEN" if is_market_open() else "CLOSED"
-        await update.message.reply_text(f"""🔍 PawOo v{VERSION} ACTIVE!
-━━━━━━━━━━━━━━━━━
-💰 ${price:,.2f if price else 0} | RSI: {rsi or 'N/A'}
-📈 EMA9: {ef} | EMA21: {es} | Bias: {bias}
-📈 H1: {htf} | {session} | {market}
-📊 {signal_count_today}/{MAX_DAILY_TRADES} trades | ${get_daily_pnl():+.2f}
-📡 {len(candles_m5)} M5 + {len(candles_h1)} H1
-━━━━━━━━━━━━━━━━━""")
-        if price and is_market_open():
-            if not active_trade and not active_signal_msg_id:
-                await generate_signal(context, price)
-
-
-# ═══════════════════════════════════════════════════════════════
-# AUTO-SCANNER
-# ═══════════════════════════════════════════════════════════════
-async def auto_scanner(context: ContextTypes.DEFAULT_TYPE):
-    reset_daily_counters()
-    if not is_market_open():
-        return
-    price = fetch_spot_price()
-    if not price:
-        return
-    if time.time() - last_candle_fetch >= 120:
-        fetch_candles()
-    if active_trade:
-        await monitor_active_trade(context, price)
-        return
-    if not is_active_session():
-        return
-    await generate_signal(context, price)
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
-def main():
-    logger.info(f"═══ PawOo Gold Signal Bot v{VERSION} Starting ═══")
-    logger.info(f"Strategy: EMA({EMA_FAST}/{EMA_SLOW}) + SMC/ICT | Min score: {MIN_CHECKLIST_SCORE}/9")
-    load_data()
-    fetch_spot_price()
-    fetch_candles()
-    logger.info(f"Data: {len(candles_m5)} M5 + {len(candles_h1)} H1")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("price", price_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("close", close_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.job_queue.run_repeating(auto_scanner, interval=SCAN_INTERVAL, first=5)
-
-    logger.info("Bot started! EMA+SMC scanning every 30s.")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    application = None # Global application instance
     main()
