@@ -45,9 +45,9 @@ SESSION_NY_START = DUBAI_TZ.localize(datetime(2000, 1, 1, 16, 0, 0))
 SESSION_NY_END = DUBAI_TZ.localize(datetime(2000, 1, 1, 0, 55, 0)) # Next day for calculation
 
 # Confidence Scoring Initial Values
-INITIAL_CONFIDENCE = 50
-CONFIDENCE_ADJUST_WIN = 5
-CONFIDENCE_ADJUST_LOSS = -7
+INITIAL_CONFIDENCE = 60
+CONFIDENCE_ADJUST_WIN = 3
+CONFIDENCE_ADJUST_LOSS = -5
 MIN_CONFIDENCE_THRESHOLD = 40
 MAX_CONFIDENCE_THRESHOLD = 80
 
@@ -88,11 +88,10 @@ class BotState:
                 'candle_pattern': INITIAL_CONFIDENCE,
                 'RSI_neutral': INITIAL_CONFIDENCE,
                 'momentum': INITIAL_CONFIDENCE,
-                'extra_filter_1': INITIAL_CONFIDENCE, # Placeholder for future filters
             },
-            'current_confidence_threshold': 60, # Initial threshold
+            'current_confidence_threshold': 55, # Initial threshold (must be <= INITIAL_CONFIDENCE)
             'adaptive_threshold_settings': {
-                'base_threshold': 60,
+                'base_threshold': 55,
                 'tight_filter_active': False,
                 'extra_filter_active': False,
             },
@@ -368,27 +367,36 @@ def calculate_ema(prices, period):
     return ema
 
 def calculate_rsi(prices, period=14):
+    """Wilder's smoothed RSI - matches MT5/TradingView."""
     if len(prices) < period + 1:
         return [np.nan] * len(prices)
 
+    rsi_values = [np.nan] * len(prices)
     deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
 
-    avg_gain = np.array([np.nan] * len(prices))
-    avg_loss = np.array([np.nan] * len(prices))
+    # Initial SMA for first RSI value
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
 
-    # Wilder's smoothing for initial average
-    avg_gain[period] = np.mean(gains[:period])
-    avg_loss[period] = np.mean(losses[:period])
+    if avg_loss == 0:
+        rsi_values[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
 
-    for i in range(period + 1, len(prices)):
-        avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i-1]) / period
-        avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i-1]) / period
+    # Wilder's smoothing for subsequent values
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi_values[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values[i + 1] = 100.0 - (100.0 / (1.0 + rs))
 
-    rs = np.divide(avg_gain, avg_loss, out=np.full_like(avg_gain, np.nan), where=avg_loss!=0)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.tolist()
+    return rsi_values
 
 def is_bullish_candle(open_price, close_price, high_price, low_price):
     return close_price > open_price and (close_price - open_price) > (high_price - low_price) * 0.3 # Body is at least 30% of range
