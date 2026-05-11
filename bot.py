@@ -437,7 +437,7 @@ def is_market_open(dt_dubai):
 # --- ALPHA Strategy Logic --- #
 async def check_alpha_strategy(current_candle, m5_candles, h1_candles):
     if len(m5_candles) < 50 or len(h1_candles) < 50: # Need enough data for EMAs
-        return None, None, None # No signal, no reasons, no confidence
+        return None, None, 0, None, None, None  # No signal
 
     closes_m5 = np.array([c['close'] for c in m5_candles])
     opens_m5 = np.array([c['open'] for c in m5_candles])
@@ -461,7 +461,7 @@ async def check_alpha_strategy(current_candle, m5_candles, h1_candles):
 
     # Check for NaN values in indicators
     if any(np.isnan([latest_ema9, latest_ema21, latest_ema50, latest_rsi])):
-        return None, None, None
+        return None, None, 0, None, None, None  # NaN indicators
 
     entry_conditions_met = {
         'EMA_aligned': False,
@@ -478,9 +478,10 @@ async def check_alpha_strategy(current_candle, m5_candles, h1_candles):
         entry_conditions_met['EMA_aligned'] = True
         reasons.append('EMA9 > EMA21 > EMA50 ✅')
 
-        if abs(latest_close - latest_ema21) <= 4.0: # Price near EMA21
+        # Price near EMA21: candle low touches/near EMA21 zone AND close above EMA21
+        if latest_low <= latest_ema21 + 4.0 and latest_close > latest_ema21:
             entry_conditions_met['price_near_EMA21'] = True
-            reasons.append('Price near EMA21 (within $4) ✅')
+            reasons.append(f'Price bounced near EMA21 (low ${latest_low:.2f} near EMA21 ${latest_ema21:.2f}) ✅')
 
             if is_bullish_candle(latest_open, latest_close, latest_high, latest_low): # Bullish candle
                 entry_conditions_met['candle_pattern'] = True
@@ -502,9 +503,10 @@ async def check_alpha_strategy(current_candle, m5_candles, h1_candles):
         entry_conditions_met['EMA_aligned'] = True
         reasons.append('EMA9 < EMA21 < EMA50 ✅')
 
-        if abs(latest_close - latest_ema21) <= 4.0: # Price near EMA21
+        # Price near EMA21: candle high touches/near EMA21 zone AND close below EMA21
+        if latest_high >= latest_ema21 - 4.0 and latest_close < latest_ema21:
             entry_conditions_met['price_near_EMA21'] = True
-            reasons.append('Price near EMA21 (within $4) ✅')
+            reasons.append(f'Price rejected near EMA21 (high ${latest_high:.2f} near EMA21 ${latest_ema21:.2f}) ✅')
 
             if is_bearish_candle(latest_open, latest_close, latest_high, latest_low): # Bearish candle
                 entry_conditions_met['candle_pattern'] = True
