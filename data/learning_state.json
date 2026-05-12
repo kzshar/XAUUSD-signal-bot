@@ -1,0 +1,33 @@
+{
+    "confidence_scores": {
+        "EMA_aligned": 60,
+        "price_near_EMA21": 60,
+        "candle_pattern": 60,
+        "RSI_neutral": 60,
+        "momentum": 60
+    },
+    "current_confidence_threshold": 55,
+    "adaptive_threshold_settings": {
+        "base_threshold": 55,
+        "tight_filter_active": false,
+        "extra_filter_active": false
+    },
+    "session_performance": {
+        "Asian": {
+            "trades": 0,
+            "wins": 0,
+            "confidence_modifier": 0
+        },
+        "London": {
+            "trades": 0,
+            "wins": 0,
+            "confidence_modifier": 0
+        },
+        "NY": {
+            "trades": 0,
+            "wins": 0,
+            "confidence_modifier": 0
+        }
+    },
+    "last_weekly_review": "2026-05-12T05:14:18.690151+04:00"
+}

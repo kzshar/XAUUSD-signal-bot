@@ -895,7 +895,9 @@ def main() -> None:
     # Scan every 30 seconds
     job_queue.run_repeating(auto_scan_for_signals, interval=30, first=10, data={'chat_id': ADMIN_CHAT_ID})
     # Weekly review every Sunday at a specific time (e.g., 01:00 Dubai time)
-    job_queue.run_daily(weekly_review_job, time=MARKET_OPEN_MONDAY.replace(hour=1, minute=0, second=0).timetz(), days=(6,), tzinfo=DUBAI_TZ)
+    from datetime import time as dt_time
+    weekly_time = dt_time(hour=1, minute=0, second=0, tzinfo=DUBAI_TZ)
+    job_queue.run_daily(weekly_review_job, time=weekly_time, days=(6,))
 
     logger.info("Bot started polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
